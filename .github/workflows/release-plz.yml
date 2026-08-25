@@ -14,6 +14,10 @@ jobs:
   # creates is what triggers cd.yml to build the binaries.
   release:
     name: Release
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      (github.repository == 'furkankly/zoetrope' || vars.ENABLE_RELEASE == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -43,6 +47,10 @@ jobs:
   # changelog entry. Merging it is what triggers the job above.
   release-pr:
     name: Release PR
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      (github.repository == 'furkankly/zoetrope' || vars.ENABLE_RELEASE == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: write
