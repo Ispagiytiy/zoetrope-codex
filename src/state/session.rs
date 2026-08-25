@@ -477,6 +477,24 @@ impl SessionModel {
                         }
                     }
                 }
+                // Codex task lifecycle records are normalized to the same
+                // notification shape but live in the child rollout itself.
+                // Claude's historical path above remains unchanged; this
+                // branch lets a child terminal event settle its own node.
+                if matches!(source, Source::Sub(_))
+                    && let Some(text) = e.prompt_text()
+                    && let Some(tn) = crate::transcript::parse_task_notification(text)
+                {
+                    // Codex child rollouts may identify lifecycle events by
+                    // `turn_id` (or omit an id entirely). The source file is
+                    // authoritative ownership; never create/apply a phantom
+                    // `codex-task` node from a payload id.
+                    if let Source::Sub(owner) = source {
+                        let mut owned = tn;
+                        owned.agent_id.clone_from(owner);
+                        self.apply_task_notification(&owned);
+                    }
+                }
                 // tool_result blocks complete tool calls (and, in the main
                 // transcript, direct-subagent + workflow nodes).
                 if let Some(msg) = &e.message
@@ -528,6 +546,15 @@ impl SessionModel {
             if let Some(usage) = &msg.usage
                 && let Some(out) = usage.output_tokens
             {
+                // Codex emits cumulative `token_count` snapshots rather than
+                // per-turn usage. Its normalized entry carries this marker so
+                // repeated snapshots update a high-water mark instead of
+                // inflating the total. Claude's request-id accounting below is
+                // unchanged.
+                if e.envelope.request_id.as_deref() == Some("codex-token-total") {
+                    agent.output_tokens = agent.output_tokens.max(out);
+                    return;
+                }
                 // One assistant turn spans multiple lines that each repeat the
                 // same cumulative usage; count it once per `requestId`. Lines
                 // with no `requestId` can't be deduped, so they sum per line.
@@ -791,6 +818,17 @@ impl SessionModel {
         let mut structural = false;
         // Workflow subagents live under a group node; ensure it exists first.
         let parent = match workflow {
+            Some(encoded) if encoded.starts_with(crate::transcript::CODEX_PARENT_PREFIX) => {
+                let parent = encoded.trim_start_matches(crate::transcript::CODEX_PARENT_PREFIX);
+                if parent.is_empty() {
+                    MAIN_ID.to_string()
+                } else {
+                    // Codex parent ids are thread ids, while the root node uses
+                    // the stable canonical `main` id. Child ids remain their
+                    // rollout session ids and therefore join transitively.
+                    parent.to_string()
+                }
+            }
             Some(wf_id) => {
                 structural |= self.ensure_agent(wf_id, AgentKind::WorkflowGroup);
                 if let Some(group) = self.agents.get_mut(wf_id)
@@ -1092,6 +1130,13 @@ fn summarize_tool(name: &str, input: &serde_json::Value, cwd: Option<&str>) -> O
     };
     match name {
         "Bash" => pick("command").or_else(|| pick("description")),
+        "exec" | "exec_command" => pick("cmd")
+            .or_else(|| pick("command"))
+            .or_else(|| pick("description"))
+            .or_else(|| input.as_str().map(truncate_summary)),
+        "apply_patch" | "patch" => pick("patch")
+            .or_else(|| pick("description"))
+            .or_else(|| input.as_str().map(truncate_summary)),
         "Read" | "Write" | "Edit" => pick_path("file_path").or_else(|| pick_path("path")),
         n if crate::transcript::is_spawn_tool(n) => {
             // Prefer the typed view for description/subagent_type.
@@ -1434,6 +1479,58 @@ mod tests {
             m.prompts.is_empty(),
             "a task-notification must not pollute the prompt spine"
         );
+    }
+
+    #[test]
+    fn codex_child_task_complete_uses_source_owner_for_turn_only_events() {
+        let line = r#"{"timestamp":"2026-08-25T10:00:00Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-123","status":"failed"}}"#;
+        let entry = crate::transcript::parse_line(line).expect("Codex lifecycle parses");
+        let mut model = SessionModel::new("root".into());
+        model.apply_update(&Update::Entry {
+            source: Source::Sub("child-rollout".into()),
+            entry,
+        });
+
+        assert_eq!(
+            model.agent("child-rollout").map(|agent| agent.status),
+            Some(AgentStatus::Failed),
+            "child source owns a turn_id-only lifecycle record"
+        );
+        assert!(model.agent("turn-123").is_none());
+        assert!(model.agent("codex-task").is_none());
+    }
+
+    #[test]
+    fn codex_function_custom_exec_and_patch_records_complete_tools() {
+        let lines = [
+            r#"{"timestamp":"2026-08-25T10:00:00Z","type":"response_item","payload":{"type":"function_call","call_id":"function-1","name":"exec_command","arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-08-25T10:00:01Z","type":"response_item","payload":{"type":"function_call_output","call_id":"function-1","output":"ok"}}"#,
+            r#"{"timestamp":"2026-08-25T10:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"custom-1","name":"apply_patch","input":{}}}"#,
+            r#"{"timestamp":"2026-08-25T10:00:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"custom-1","output":"ok"}}"#,
+            r#"{"timestamp":"2026-08-25T10:00:04Z","type":"response_item","payload":{"type":"function_call","call_id":"exec-1","name":"exec_command","arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-08-25T10:00:05Z","type":"event_msg","payload":{"type":"exec_command_end","command_id":"exec-1","success":true,"output":"done"}}"#,
+            r#"{"timestamp":"2026-08-25T10:00:06Z","type":"response_item","payload":{"type":"function_call","call_id":"patch-1","name":"apply_patch","arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-08-25T10:00:07Z","type":"event_msg","payload":{"type":"patch_apply_end","patch_id":"patch-1","success":false,"output":"reject"}}"#,
+        ];
+        let mut model = SessionModel::new("root".into());
+        for line in lines {
+            model.apply_update(&Update::Entry {
+                source: Source::Main,
+                entry: crate::transcript::parse_line(line).expect("Codex record parses"),
+            });
+        }
+
+        let calls = &model.agent(MAIN_ID).unwrap().tool_calls;
+        let state = |id: &str| {
+            calls
+                .iter()
+                .find(|call| call.id == id)
+                .map(|call| call.state)
+        };
+        assert_eq!(state("function-1"), Some(ToolState::Ok));
+        assert_eq!(state("custom-1"), Some(ToolState::Ok));
+        assert_eq!(state("exec-1"), Some(ToolState::Ok));
+        assert_eq!(state("patch-1"), Some(ToolState::Err));
     }
 
     #[test]
@@ -2315,5 +2412,23 @@ mod tests {
         // async spawn-ack was superseded by its own activity, or it never got a
         // reliable completion) — settle it to Done rather than leave it "live".
         assert_eq!(m.agent("sub1").unwrap().status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn codex_parent_marker_preserves_nested_thread_identity() {
+        let mut m = SessionModel::new("root-thread".into());
+        let meta = crate::transcript::SubagentMeta {
+            agent_type: Some("codex".into()),
+            description: Some("child".into()),
+            tool_use_id: None,
+            stopped_by_user: None,
+        };
+        m.apply_meta("child", None, &meta);
+        m.apply_meta("grandchild", Some("\u{1f}codex-parent:child"), &meta);
+        assert_eq!(m.agent("child").unwrap().parent.as_deref(), Some(MAIN_ID));
+        assert_eq!(
+            m.agent("grandchild").unwrap().parent.as_deref(),
+            Some("child")
+        );
     }
 }
