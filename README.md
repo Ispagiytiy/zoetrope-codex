@@ -88,15 +88,20 @@ zoe --provider codex         # choose Codex CLI's local session store
 zoe --provider auto          # detect a known provider layout or record shape
 zoe --provider codex <dir>   # follow a Codex session directory
 zoe --provider auto <file>   # detect the provider for one explicit file
-zoe inspect --provider codex <file.jsonl>
+zoe inspect <file.jsonl> --provider codex
 ```
 
 Give it a file and it reads the whole transcript, then keeps watching for new lines.
 Give it a directory, or no argument at all, and it finds the newest session in that
 project and follows it live. An explicit file is always read as the selected session;
-it does not mix in neighboring provider files. `auto` uses the known layout and record
-markers; if a path is ambiguous, choose `claude` or `codex` explicitly. Whichever way
-you start, the controls are the same: scrub, follow, pause, jump back to live.
+it does not mix in neighboring provider files. Native directory discovery with `auto`
+keeps Claude Code precedence for backwards compatibility when both provider stores are
+available; use `--provider codex` to choose Codex explicitly. A concrete file detected
+as the other provider is rejected when an explicit provider is selected. The browser
+picker uses a stricter rule: a mixed Claude/Codex selection is an error, so choose one
+provider.
+Whichever way you start, the controls are the same: scrub, follow, pause, jump back to
+live.
 
 ### Session locations and privacy
 
@@ -118,6 +123,9 @@ The same engine also runs [in the browser](https://zoetrope.furkankly.dev/app),
 compiled to WebAssembly via [ratzilla](https://github.com/ratatui/ratzilla). Open a
 Claude or Codex session from a folder, or drop a transcript on the page. The selected
 bytes are handled locally in the browser and are not uploaded by the app.
+In Chromium, Codex live-follow re-scans the selected sessions tree as it polls, so
+child rollout files created after opening can join the graph. Other browsers provide
+immutable snapshots and cannot follow later writes.
 
 ## Features
 

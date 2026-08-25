@@ -20,8 +20,10 @@ their directory discovery, record decoding, timestamp extraction, and provider-s
 completion signals; the shared timeline and `SessionModel` consume normalized facts.
 Provider choice is explicit (`claude` or `codex`) or a best-effort `auto` detection of
 known layouts/record markers. A concrete file is pinned to that file and is never
-merged with neighboring sessions. If a directory is ambiguous, explicit selection is
-required rather than guessing from a tool name.
+merged with neighboring sessions. Native directory discovery keeps Claude precedence
+under `auto` for backwards compatibility when both provider stores are available;
+explicit selection overrides it. The browser picker has a stricter contract and must
+reject mixed Claude/Codex selections instead of silently choosing one.
 
 The default roots are provider-specific: Claude Code uses
 `~/.claude/projects/<sanitized-cwd>/`; Codex CLI uses

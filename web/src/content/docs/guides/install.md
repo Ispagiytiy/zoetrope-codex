@@ -41,8 +41,12 @@ zoe --provider codex /path/to/rollout.jsonl
 zoe --provider auto /path/to/session-or-provider-directory
 ```
 
-Use `auto` when the layout or record markers identify the provider. If a directory is
-ambiguous, select `claude` or `codex` explicitly.
+Native `auto` keeps Claude Code precedence for backwards compatibility when both
+provider stores are available; use `--provider codex` to select Codex explicitly and
+to respect an explicit Codex file or directory. A concrete file detected as the other
+provider is rejected when an explicit provider is selected. The browser picker has a
+stricter rule: mixed Claude/Codex selections are an explicit error, so choose one
+provider before opening the files or folder.
 
 ## Install the terminal app
 

@@ -27,12 +27,12 @@ zoe --provider codex     # choose Codex CLI's local session store
 zoe --provider auto      # detect a known provider layout or record shape
 zoe --provider codex <dir>
 zoe --provider auto <file.jsonl>
-zoe inspect --provider codex <file.jsonl>
+zoe inspect <file.jsonl> --provider codex
 ```
 
-Resolution: a **file** target bulk-loads + tails (replay feeder); a **dir** (or none → cwd/provider store) discovers the latest session and live-tails. `--follow` only changes the start position (head vs beginning) via `Mode`. `--provider` accepts `claude`, `codex`, or `auto`; explicit provider selection wins over discovery, while `auto` uses known directory layouts and record markers. A concrete file is always pinned to that file and never mixed with neighboring provider files. `Cli = View { provider, target: Option<PathBuf>, follow: bool, speed: f64 } | Inspect { provider, file }`. Arg parsing remains hand-rolled over `std::env::args` (no clap; keep deps lean).
+Resolution: a **file** target bulk-loads + tails (replay feeder); a **dir** (or none → cwd/provider store) discovers the latest session and live-tails. `--follow` only changes the start position (head vs beginning) via `Mode`. `--provider` accepts `claude`, `codex`, or `auto`; explicit provider selection wins over discovery. Native `auto` keeps Claude Code precedence for backwards compatibility when both provider stores are available, while explicit `--provider codex` selects Codex. A concrete file detected as the other provider is rejected when an explicit provider is selected and is never mixed with neighboring files. The browser picker has a stricter contract: a mixed Claude/Codex selection is an explicit error. `Cli = View { provider, target: Option<PathBuf>, follow: bool, speed: f64 } | Inspect { provider, file }`. Arg parsing remains hand-rolled over `std::env::args` (no clap; keep deps lean).
 
-Provider roots are local and overridable: Claude Code uses `~/.claude/projects/<sanitized-cwd>/`; Codex CLI uses `$CODEX_HOME/sessions/YYYY/MM/DD/`, with `$CODEX_HOME` defaulting to `~/.codex`. `auto` can identify a selected file or directory from its record shape/layout; when a directory contains ambiguous candidates, pass an explicit provider.
+Provider roots are local and overridable: Claude Code uses `~/.claude/projects/<sanitized-cwd>/`; Codex CLI uses `$CODEX_HOME/sessions/YYYY/MM/DD/`, with `$CODEX_HOME` defaulting to `~/.codex`. `zoe --provider codex <dir>` respects the explicit Codex directory (including a custom `CODEX_HOME` or sessions subtree); `auto` uses the existing Claude-first native discovery when both stores are present. Browser folder selection rejects mixed provider candidates instead of silently choosing one.
 
 ### Provider boundary
 
@@ -322,11 +322,11 @@ The crossterm input channel is **unbounded** (input must never block); the **cap
 
 ## UI
 
-- **AgentNode card** (ui/nodes.rs): border + title (glyph + agent_type, or "claude" for main), description (truncated), tools line (`⚒ N · last_tool`), footer (**status word + output token count**, e.g. `running · 1.2k tok`). Read `ctx.theme.palette()`, `ctx.selected`. **Five status glyphs** (single source: `AgentStatus::glyph`/`status_word`/`status_color`): `●` running (green; a `●`/`○` pulse on the animation clock), `◌` idle (subtle), `✓` done (gold/accent), `✗` failed (red), `■` stopped (muted). *(The help-overlay legend still lists only 4 — Stopped is omitted there.)*
+- **AgentNode card** (ui/nodes.rs): border + title (glyph + agent_type, or "main" for the main agent), description (truncated), tools line (`⚒ N · last_tool`), footer (**status word + output token count**, e.g. `running · 1.2k tok`). Read `ctx.theme.palette()`, `ctx.selected`. **Five status glyphs** (single source: `AgentStatus::glyph`/`status_word`/`status_color`): `●` running (green; a `●`/`○` pulse on the animation clock), `◌` idle (subtle), `✓` done (gold/accent), `✗` failed (red), `■` stopped (muted). *(The help-overlay legend still lists only 4 — Stopped is omitted there.)*
 - **Detail panel** (ui/panel.rs): when `flow.selected_nodes().next()` is Some → a **30/70** horizontal split (orientation canvas 30% · panel 70%); panel shows the selected agent's description, model, status, timing, and a scrollable recent-tool-call list (name + summary, `⏳`/`✓`/`✗` + local time; path tools keep the basename). Data from `SessionModel`, keyed by node id. Copy the selected id out before borrowing app mutably elsewhere (borrow-checker note from rwy).
 - **Tool-call chips** (ui/chips.rs): ephemeral `⚒ read ×N` overlays anchored *below* agent cards (NOT graph nodes — no layout/minimap/hit-test), drawn in `render_canvas` after the flow. One reconcile pass per frame ages them in watch-time; pending persists as the in-flight indicator, completed fade (`CHIP_TTL` 2.5s, err 4s, ≤3/agent), width-gated like edge labels. This is where "current tool" lives now — edges carry no labels. Full model: [`ARCHITECTURE.md`](ARCHITECTURE.md) §5.
 - **Scrubber** (`render_scrubber`, shown when the timeline has a span): a **bordered panel** (rounded, subtle), 6 rows = border + marker strip (1) + bars (2) + info (1) + border. Markers and bars are on **separate rows** so neither can overwrite the other (a marker on a bar cell hid real activity; the gap seam was the worst offender).
-  - **Marker strip (1 row, on top)**: **fast-forward `»`** at idle-gap columns (≥`GAP_MARKER_SECS`, where playback compresses dead air; full-session; drawn only when gap-compression is on); **spawn `❋`** (the Claude sunburst, in Claude coral ≈ xterm 173 — `Entry::spawn_count`) and **failure `✗`** (red, `Entry::tool_failure_count`), **past-only** (`c < head`) so they reveal as the playhead reaches them (in sync with the graph's chips).
+  - **Marker strip (1 row, on top)**: **fast-forward `»`** at idle-gap columns (≥`GAP_MARKER_SECS`, where playback compresses dead air; full-session; drawn only when gap-compression is on); **spawn `❋`** (a provider-neutral sunburst in coral ≈ xterm 173 — `Entry::spawn_count`) and **failure `✗`** (red, `Entry::tool_failure_count`), **past-only** (`c < head`) so they reveal as the playhead reaches them (in sync with the graph's chips).
   - **Activity bars (2 rows)**: a tool-call sparkline via ratatui's `Sparkline` — per-column height = tool calls in that slice (`Entry::tool_use_count` summed over the column's item-index range, binned on the event-index axis). Counts normalized to the available eighths (`rows × 8` = 16) with a **floor of 1 for any nonzero column** (`ceil(count/max × levels)`) — else the busiest column scales the rest down and a low-activity tick rounds to 0 (invisible). Played/unplayed fill: bright accent left of the playhead, dim right.
   - **Playhead**: a gold vertical line `│` over a translucent (`muted`-bg) column, spanning the marker strip + both bar rows.
   - **Info row**: playhead date+time (left), transport tag (right). Full-width so changing labels can't reflow it; the whole row is the seekable area, so a click maps to the exact width the playhead is drawn over. Row 2 is an info line: the playhead's local date+time (left) and the emergent transport tag (right). `App.scrubber_area` is recorded each frame for hit-testing mouse drags.
@@ -351,7 +351,8 @@ Worth testing: transcript line parsing against real-format fixture strings (ever
 - [ ] `--provider claude`, `--provider codex`, and `--provider auto` cover both
   explicit file targets and directory discovery, including `CODEX_HOME` overrides.
 - [ ] `auto` and an explicit provider produce the same model for an unambiguous file;
-  ambiguous or mixed directories never silently merge sessions.
+  native `auto` preserves Claude precedence for backwards compatibility, while
+  browser mixed selections are rejected instead of silently merged.
 - [ ] Unknown/malformed provider records are skipped without aborting the session;
   timestamps, tool status, and terminal state still converge in live and replay paths.
 - [ ] Browser tests/QA verify that the user-selected folder is the only input and
@@ -371,7 +372,8 @@ Worth testing: transcript line parsing against real-format fixture strings (ever
 - [ ] `is_error` missing = success
 - [ ] user content + tool_result content polymorphic string|array
 - [ ] Keep Claude discovery scoped to `<uuid>.jsonl` + `subagents/**/agent-*.jsonl`; keep Codex discovery scoped to `$CODEX_HOME/sessions/**/rollout-*.jsonl`; never treat provider noise files as sessions
-- [ ] Provider auto-detection is content/layout based and never merges an ambiguous directory without explicit selection
+- [ ] Native provider auto-detection is content/layout based with Claude precedence;
+  browser mixed selections require explicit provider choice and never silently merge
 - [ ] camera modes per the Camera section (Overview auto-fit / Follow tracking / Manual); min_zoom raised
 - [ ] Native/core dependency tree has no HTTP client; browser page traffic (assets/analytics) is documented separately from local transcript processing
 - [ ] First render has zero canvas size — `request_fit_view` (deferred) not `fit_view`

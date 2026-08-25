@@ -23,7 +23,11 @@ assets, fonts, or analytics.
 The provider can be selected explicitly (`claude` or `codex`) or detected with
 `auto`. Claude Code normally uses `~/.claude/projects/<sanitized-cwd>/`; Codex CLI
 normally uses `$CODEX_HOME/sessions/YYYY/MM/DD/`, with `$CODEX_HOME` defaulting to
-`~/.codex`. A concrete file is pinned and never merged with neighboring sessions.
+`~/.codex`. Native `auto` keeps Claude Code precedence for backwards compatibility
+when both stores are available; an explicit `--provider codex` selects Codex and
+respects an explicit file or directory. A concrete file is pinned and never merged
+with neighboring sessions. Browser mixed selections are rejected instead of being
+silently assigned to one provider.
 
 ## The model is a projection
 
@@ -150,9 +154,11 @@ The module map, transcript format, and type shapes are in
 - Use synthesized or redacted Codex rollout fixtures; never commit raw prompts,
   paths, tool payloads, credentials, or session logs.
 - Test explicit `claude`/`codex` selection and `auto` detection for both files and
-  directories, including a `CODEX_HOME` override and ambiguous directories.
+  directories, including a `CODEX_HOME` override and Claude-precedence directories.
 - Verify that unknown or malformed records are skipped, live and replay converge,
   and a selected file is never merged with neighboring sessions.
 - Browser QA must confirm that the user-selected folder is the only local input and
   the selected log bytes are not uploaded. The page's separate asset/font/analytics
-  requests are expected and must not be described as transcript uploads.
+  requests are expected and must not be described as transcript uploads. Chromium
+  Codex live-follow re-scans the selected sessions tree while polling, so a later
+  child rollout can join the graph.

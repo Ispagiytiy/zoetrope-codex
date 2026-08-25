@@ -22,15 +22,18 @@ zoe --provider codex         use Codex CLI's local session store
 zoe --provider auto          detect a known provider layout or record shape
 zoe --provider codex <dir>   follow a Codex session directory
 zoe --provider auto <file>   detect the provider for one explicit file
-zoe inspect --provider codex <file.jsonl>
+zoe inspect <file.jsonl> --provider codex
 ```
 
 A **file** target bulk-loads then tails it; a **directory** (or none → the current
 project) discovers the latest session and follows it live. `--follow` only changes
 where the playhead starts (the live edge instead of the beginning). An explicit file
-is always read as that session and does not mix neighboring provider files. `auto`
-uses known layout and record markers; if a path is ambiguous, choose `claude` or
-`codex` explicitly.
+is always read as that session and does not mix neighboring provider files. Native
+`auto` keeps Claude Code precedence for backwards compatibility when both provider
+stores are available; use an explicit `--provider codex` to select Codex. A concrete
+file detected as the other provider is rejected when an explicit provider is selected.
+The browser picker is stricter: mixed Claude/Codex selections are an error, so choose
+one provider before opening them.
 
 ### Session locations
 
@@ -47,7 +50,9 @@ The [browser app](/app) boots into a bundled demo. To watch your own session:
 - **Sessions** (Chromium browsers): click **Sessions**, choose Claude Code or Codex,
   pick a local folder, and follow it live when the browser supports the File System
   Access API. zoetrope reads the selected provider's transcript files and tails the
-  folder for new activity. Nothing from the selected logs is uploaded by zoetrope.
+  folder for new activity. Codex live-follow re-scans the selected sessions tree as it
+  polls, so child rollout files created after opening can join the graph. Nothing from
+  the selected logs is uploaded by zoetrope.
 - **Sessions** (other browsers): the same button falls back to a folder picker,
   so browsing and replaying work everywhere. **Following live does not** — without
   the File System Access API the browser hands over an immutable *snapshot* of
@@ -56,7 +61,8 @@ The [browser app](/app) boots into a bundled demo. To watch your own session:
 - **Drag and drop** a `.jsonl` transcript (any browser). A drop carries only what
   you dropped. For Claude, drag the `<uuid>.jsonl` **and** its `<uuid>/` folder together
   to include sidecar subagents and workflows. For Codex, include the rollout files you
-  want to inspect and choose the provider if auto-detection is ambiguous.
+  want to inspect; a mixed Claude/Codex drop in `auto` is rejected, so choose one
+  provider explicitly.
 
 ### Privacy when using the browser
 
