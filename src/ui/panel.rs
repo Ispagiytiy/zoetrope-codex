@@ -186,7 +186,7 @@ fn render_header(frame: &mut Frame, area: Rect, agent: &AgentInfo, palette: &rat
     let mut lines: Vec<Line> = Vec::new();
 
     // Title: agent type, bold.
-    let title = agent.agent_type.as_deref().unwrap_or("claude");
+    let title = agent.agent_type.as_deref().unwrap_or("main");
     lines.push(Line::from(Span::styled(
         title,
         bg.fg(palette.text).add_modifier(Modifier::BOLD),

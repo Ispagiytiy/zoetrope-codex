@@ -5,7 +5,7 @@
 <h1 align="center">zoetrope</h1>
 
 <p align="center">
-  <em>Watch a Claude Code session as a live flow graph, in your terminal or your browser.</em>
+  <em>Watch a Claude Code or Codex session as a live flow graph, in your terminal or your browser.</em>
 </p>
 
 <p align="center">
@@ -24,11 +24,17 @@
   <img src="https://raw.githubusercontent.com/furkankly/zoetrope/main/assets/zoetrope.svg" alt="A session drawn as a flow graph: a main agent above the subagents it spawned, over a timeline of tool activity" width="620">
 </p>
 
-Claude Code writes a JSONL transcript for every session under `~/.claude/projects/`.
-zoetrope reads it and draws the session as a graph in your terminal: the main agent, the subagents and
-workflows it spawns, and the tools each one runs, updating live as it goes. Point it
-at a finished run and it replays, paced by the session's own timestamps. Point it at a
-running one and it follows along. It's read-only, and nothing leaves your machine.
+Claude Code and Codex write JSONL transcripts for their local sessions. zoetrope reads
+either provider and draws the session as a graph in your terminal: the main agent, the
+subagents and workflows it records, and the tools each one runs, updating live as it
+goes. Point it at a finished run and it replays, paced by the session's own timestamps;
+point it at a running one and it follows along. The native app is read-only, needs no
+provider authentication, and sends no transcript bytes anywhere.
+
+By default, Claude Code sessions are under `~/.claude/projects/`. Codex CLI sessions
+are under `$CODEX_HOME/sessions/YYYY/MM/DD/` (`$CODEX_HOME` defaults to `~/.codex`).
+Use `--provider claude`, `--provider codex`, or `--provider auto` when you want to
+choose or detect the source explicitly.
 
 Built on [ratatui](https://ratatui.rs) and [rataflow](https://github.com/furkankly/rataflow).
 
@@ -63,7 +69,9 @@ cargo build --release
 ```
 
 No install at all: **[try it in your browser](https://zoetrope.furkankly.dev/app)**.
-Drop a transcript on the page and get the same graph.
+Choose a local folder or drop a transcript on the page and get the same graph. The
+selected log bytes are parsed in your browser and are not uploaded by zoetrope; the
+hosted page itself still loads its normal static assets and may load site analytics.
 
 ## Usage
 
@@ -74,16 +82,50 @@ zoe <file.jsonl>             # replay a recording from the start
 zoe <file.jsonl> --follow    # open a recording at its live edge
 zoe <file.jsonl> --speed N   # playback speed (default 8.0)
 zoe inspect <file.jsonl>     # print the session tree and exit (no TUI)
+
+zoe --provider claude        # choose Claude Code's local session store
+zoe --provider codex         # choose Codex CLI's local session store
+zoe --provider auto          # detect a known provider layout or record shape
+zoe --provider codex <dir>   # follow a Codex session directory
+zoe --provider auto <file>   # detect the provider for one explicit file
+zoe inspect <file.jsonl> --provider codex
 ```
 
 Give it a file and it reads the whole transcript, then keeps watching for new lines.
 Give it a directory, or no argument at all, and it finds the newest session in that
-project and follows it live. Whichever way you start, the controls are the same:
-scrub, follow, pause, jump back to live.
+project and follows it live. An explicit file is always read as the selected session;
+it does not mix in neighboring provider files. Native directory discovery with `auto`
+keeps Claude Code precedence for backwards compatibility when both provider stores are
+available; use `--provider codex` to choose Codex explicitly. A concrete file detected
+as the other provider is rejected when an explicit provider is selected. The browser
+picker uses a stricter rule: a mixed Claude/Codex selection is an error, so choose one
+provider.
+Whichever way you start, the controls are the same: scrub, follow, pause, jump back to
+live.
+
+### Session locations and privacy
+
+Claude Code's default store is `~/.claude/projects/<sanitized-cwd>/`, with a
+`<session-uuid>.jsonl` main transcript and any provider-specific sidecars below its
+session directory. Codex CLI's default store is `$CODEX_HOME/sessions/`, partitioned
+by date. Set `CODEX_HOME` before launching zoetrope to inspect a non-default Codex
+store; an explicit file or directory path is also supported.
+
+Transcript JSONL can contain prompts, working directories, file paths, tool inputs and
+outputs, snippets of source code, and model metadata. Treat it as sensitive data. The
+native app only reads it and does not require Claude/Codex credentials. In the browser,
+you choose the folder or files yourself; the browser does not grant zoetrope access to
+other folders, and selected log bytes stay in the page. The website may still request
+its own assets, fonts, or analytics, so “local” refers to transcript processing rather
+than to the hosting page's network requests.
 
 The same engine also runs [in the browser](https://zoetrope.furkankly.dev/app),
 compiled to WebAssembly via [ratzilla](https://github.com/ratatui/ratzilla). Open a
-session from disk, or drop a transcript on the page. It stays local there too.
+Claude or Codex session from a folder, or drop a transcript on the page. The selected
+bytes are handled locally in the browser and are not uploaded by the app.
+In Chromium, Codex live-follow re-scans the selected sessions tree as it polls, so
+child rollout files created after opening can join the graph. Other browsers provide
+immutable snapshots and cannot follow later writes.
 
 ## Features
 
@@ -115,9 +157,10 @@ session from disk, or drop a transcript on the page. It stays local there too.
 - Follows a running session live, or replays a finished one
 - Reads everything a session writes: the main transcript, its subagents, and
   workflows with their own children, so the graph is the whole picture
-- Keeps going when Claude Code writes something it hasn't seen: unfamiliar records
+- Keeps going when either provider writes something it hasn't seen: unfamiliar records
   are skipped, never fatal
-- Read-only, and no network at all (see below)
+- Read-only transcript handling; see the privacy note above for the hosted browser
+  page's own asset and analytics requests
 
 ## Keys
 
@@ -183,9 +226,10 @@ A few of the pieces that turn a log into a watchable session:
 - **You own the camera, not the history.** The recording is immutable and the graph
   never rearranges itself under you (`r` to relayout). The camera follows the action
   until you touch it, then stays where you put it.
-- **Zero network, provably.** There is no HTTP client anywhere in the dependency tree,
-  and `tokio` is pulled in without its `net` feature. `cargo tree` is the proof. This is
-  a property you can check, not a promise.
+- **Local transcript processing.** The native binary has no HTTP client and reads only
+  the path you select. The hosted browser page necessarily loads its app assets and
+  may load analytics, but the transcript bytes selected in the page are parsed in the
+  browser and are not uploaded by zoetrope.
 
 The model, the timeline and the rendering all live in the **portable core**, a
 library with no IO that compiles for any target, including WebAssembly. The native
@@ -198,11 +242,13 @@ and [`docs/ARCHITECTURE.md`](https://github.com/furkankly/zoetrope/blob/main/doc
 
 ## A note on the transcript format
 
-The JSONL format zoetrope reads is undocumented and internal to Claude Code, so it can
-change without warning. zoetrope is built to degrade rather than break: unrecognized
-records are skipped, missing fields fall back, and a malformed line never takes down
-the session. If a new Claude Code release makes something render oddly, please
-[open an issue](https://github.com/furkankly/zoetrope/issues).
+The JSONL formats zoetrope reads are provider-specific, undocumented, and subject to
+change. Claude Code and Codex may add record kinds or change optional fields without
+warning. zoetrope is built to degrade rather than break: `auto` looks for known layout
+and record markers, unrecognized records are skipped, missing fields fall back, and a
+malformed line never takes down the session. If a provider release makes something
+render oddly, please [open an issue](https://github.com/furkankly/zoetrope/issues) with
+a sanitized example—never attach a raw session log.
 
 ## Contributing
 
@@ -210,6 +256,9 @@ Pull requests are welcome.
 
 - This project follows [Conventional Commits](https://www.conventionalcommits.org/) for all commit messages (e.g. `feat(timeline): index the playhead by event instead of wall-clock`, `fix(tailer): fold appends at the live edge without rebuilding`). The changelog is generated from them with [git-cliff](https://github.com/orhun/git-cliff), and non-conforming commits are dropped.
 - Run `cargo fmt`, `cargo clippy` and `cargo test` before opening a PR.
+- Keep the provider QA contract covered: Claude fixtures must remain unchanged, Codex
+  fixtures must be sanitized, `auto` and explicit provider selection must agree on
+  the same file, and no test should require credentials or network access.
 - Those cover the portable core and the native frontend. The browser frontend is a
   second crate (`zoetrope-web`, in `web/wasm/`) that only builds for wasm32, so it is
   excluded from the root workspace and no root `cargo` command touches it. From the
