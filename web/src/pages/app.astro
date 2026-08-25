@@ -3,7 +3,8 @@
 // docs route). It loads the WebAssembly build (the Rust `web` bin, compiled by
 // `pnpm build:wasm` into /public/wasm) which boots into the bundled demo, then
 // lets you replay your own transcript or — in Chromium — open a session folder
-// and follow it live. Everything runs locally; nothing is uploaded.
+// and follow it live. Transcript bytes are processed locally and are not uploaded
+// by the app; the hosted page may still load its own assets and analytics.
 import { Font } from 'astro:assets';
 import Analytics from '../components/Analytics.astro';
 import Seo from '../components/Seo.astro';
@@ -21,12 +22,12 @@ const wasmBase = '/wasm';
     <title>zoetrope — browser app</title>
     <meta
       name="description"
-      content="Run zoetrope in your browser: replay a Claude Code session transcript as a live flow graph, fully locally."
+      content="Run zoetrope in your browser: replay Claude Code or Codex session transcripts as a live flow graph. Transcript bytes are processed locally and are not uploaded."
     />
     <Schema />
     <Seo
       title="zoetrope — browser app"
-      description="Run zoetrope in your browser: replay a Claude Code session transcript as a live flow graph, fully locally."
+      description="Run zoetrope in your browser: replay Claude Code or Codex session transcripts as a live flow graph. Transcript bytes are processed locally and are not uploaded."
     />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <!-- Same self-hosted brand fonts as the landing (Space Mono for the wordmark,
@@ -154,6 +155,32 @@ const wasmBase = '/wasm';
         cursor: not-allowed;
         border-color: #343434;
         color: var(--dim);
+      }
+      .provider-picker {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        color: var(--dim);
+        font-size: 0.72rem;
+        white-space: nowrap;
+      }
+      .provider-picker select {
+        max-width: 9.4rem;
+        font-family: var(--mono);
+        font-size: 0.74rem;
+        color: var(--bright);
+        background: var(--panel);
+        border: 1px solid #343434;
+        border-radius: 5px;
+        padding: 0.25rem 0.35rem;
+      }
+      .provider-picker select:focus-visible {
+        outline: 1px solid var(--gold);
+        outline-offset: 1px;
+      }
+      @media (max-width: 700px) {
+        .provider-picker span { display: none; }
+        .provider-picker select { max-width: 7rem; }
       }
       .link {
         color: var(--dim);
@@ -446,7 +473,16 @@ const wasmBase = '/wasm';
       <span id="status" class="statusbar">loading wasm…</span>
       <span class="spacer"></span>
 
-      <button id="open-folder" class="act primary" title="Browse your Claude sessions and replay or follow one live.">
+      <label class="provider-picker" for="provider-select">
+        <span>Provider</span>
+        <select id="provider-select" aria-label="Session provider">
+          <option value="auto" selected>Auto-detect</option>
+          <option value="claude">Claude Code</option>
+          <option value="codex">Codex</option>
+        </select>
+      </label>
+
+      <button id="open-folder" class="act primary" title="Browse local Claude Code or Codex sessions and replay or follow one live.">
         Sessions
       </button>
       <input id="dir-input" type="file" webkitdirectory hidden />
@@ -458,7 +494,7 @@ const wasmBase = '/wasm';
 
     <div id="terminal-container"></div>
 
-    <div id="drop" class="drop">Drop a session's &lt;uuid&gt;.jsonl here (with its &lt;uuid&gt;/ folder for subagents) to replay it, or use “Sessions” to browse your Claude projects.</div>
+    <div id="drop" class="drop">Drop a Claude transcript or a Codex <code>rollout-*.jsonl</code> here to replay it. Include related files when available.</div>
 
     <!-- Small-screen heads-up: the graph is dense and needs a mouse/keyboard.
          Dismissable, so a curious phone visitor can still watch the replay. -->
@@ -485,7 +521,8 @@ const wasmBase = '/wasm';
     </div>
 
     <!-- Shown before the OS file dialog: the dialog can't be annotated and won't
-         open ~/.claude/projects on its own, so spell out how to get there. -->
+         open either provider's sessions directory on its own, so spell out how
+         to get there. -->
     <div id="picker-help" class="modal">
       <div class="modal-panel">
         <div class="modal-head">
@@ -494,15 +531,15 @@ const wasmBase = '/wasm';
         </div>
         <div class="help-body">
           <p>
-            Your Claude sessions live in
-            <code id="claude-path">~/.claude/projects</code>
+            <span id="provider-path-label">Sessions are searched in</span>
+            <code id="provider-path">~/.claude/projects</code>
             <button id="copy-path" class="copy-btn" title="Copy the path">copy</button>
           </p>
-          <p class="help-dim">The file dialog won't open that folder for you, so:</p>
+          <p id="provider-help" class="help-dim">Choose Auto-detect to keep the existing Claude Code flow, or select a provider explicitly.</p>
           <ol class="help-steps">
             <li><b>macOS:</b> press <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>G</kbd>, paste the path, then <kbd>return</kbd>.</li>
             <li><b>Windows / Linux:</b> press <kbd>Ctrl</kbd> <kbd>L</kbd>, or type the path in the location bar.</li>
-            <li>Pick the <b>projects</b> folder, or a single project inside it.</li>
+            <li>Pick the displayed sessions folder, or a subfolder inside it. A custom <code>CODEX_HOME</code> is supported by choosing its <code>sessions</code> directory.</li>
           </ol>
           <div class="help-actions">
             <button id="help-open" class="act primary">Open the file picker →</button>
@@ -530,14 +567,49 @@ const wasmBase = '/wasm';
       const helpCancel = document.getElementById('help-cancel');
       const helpClose = document.getElementById('help-close');
       const copyPath = document.getElementById('copy-path');
+      const providerSelect = document.getElementById('provider-select');
+      const providerPath = document.getElementById('provider-path');
+      const providerPathLabel = document.getElementById('provider-path-label');
+      const providerHelp = document.getElementById('provider-help');
 
       let ready = false;
       let liveState = null;
       let liveTimer = null;
+      let selectedProvider = 'auto';
       // The last session list shown, so the "Sessions" button can re-open the
       // picker instantly (change session) without re-picking the folder.
       let lastSessions = null;
       let lastRepoName = '';
+
+      const PROVIDERS = {
+        auto: {
+          label: 'Auto-detect',
+          path: '~/.claude/projects or ~/.codex/sessions',
+          help: 'Claude Code remains the compatible default. Auto-detect also accepts Codex rollout files; mixed selections require an explicit provider.',
+        },
+        claude: {
+          label: 'Claude Code',
+          path: '~/.claude/projects',
+          help: 'Pick the projects folder or one project folder. Existing subagents and workflows remain supported.',
+        },
+        codex: {
+          label: 'Codex',
+          path: '~/.codex/sessions',
+          help: 'Pick the sessions folder, a YYYY/MM/DD folder, or a custom CODEX_HOME/sessions directory. Authentication files are never read.',
+        },
+      };
+
+      function providerSpec() {
+        return PROVIDERS[selectedProvider] || PROVIDERS.auto;
+      }
+
+      function updateProviderCopy() {
+        const spec = providerSpec();
+        providerPath.textContent = spec.path;
+        providerPathLabel.textContent = selectedProvider === 'auto' ? 'Sessions are searched in' : `${spec.label} sessions live in`;
+        providerHelp.textContent = spec.help;
+        copyPath.dataset.path = spec.path.split(' or ')[0];
+      }
 
       function setStatus(msg, isErr = false, live = false) {
         statusEl.className = 'statusbar' + (isErr ? ' err' : '');
@@ -556,9 +628,203 @@ const wasmBase = '/wasm';
         return { fresh, consumed: complete };
       }
 
+      const CODEX_ROLLOUT_JSONL = /^rollout-\d{4}-\d{2}-\d{2}T[^/]+\.jsonl$/i;
+      const CLAUDE_TYPES = new Set([
+        'user',
+        'assistant',
+        'system',
+        'attachment',
+        'ai-title',
+        'last-prompt',
+        'mode',
+        'permission-mode',
+        'file-history-snapshot',
+        'queue-operation',
+        'started',
+        'result',
+      ]);
+
+      const yieldToUi = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+      function sniffProvider(text) {
+        for (const line of text.slice(0, 262144).split('\n')) {
+          if (!line.trim()) continue;
+          let value;
+          try {
+            value = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (
+            value?.type === 'session_meta' ||
+            value?.type === 'event_msg' ||
+            value?.type === 'response_item' ||
+            value?.type === 'compacted' ||
+            value?.type === 'turn_context' ||
+            value?.type === 'world_state' ||
+            value?.record_type === 'response'
+          ) {
+            return 'codex';
+          }
+          if (CLAUDE_TYPES.has(value?.type)) return 'claude';
+        }
+        return null;
+      }
+
+      function validateProvider(text, filename = 'the selected file') {
+        const detected = sniffProvider(text) || (UUID_JSONL.test(filename) ? 'claude' : null);
+        if (selectedProvider !== 'auto' && detected && detected !== selectedProvider) {
+          setStatus(
+            `${filename} looks like ${PROVIDERS[detected].label}, but ${PROVIDERS[selectedProvider].label} is selected. Choose Auto-detect or the matching provider.`,
+            true,
+          );
+          return null;
+        }
+        if (!detected) {
+          setStatus(
+            `Unsupported transcript format in ${filename}. Expected Claude JSONL or a Codex rollout JSONL.`,
+            true,
+          );
+          return null;
+        }
+        return detected;
+      }
+
+      function stringId(value) {
+        return typeof value === 'string' || typeof value === 'number' ? String(value) : '';
+      }
+
+      function codexMeta(text) {
+        for (const line of text.slice(0, 65536).split('\n')) {
+          if (!line.trim()) continue;
+          let value;
+          try {
+            value = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (value?.type !== 'session_meta' || !value.payload) continue;
+          const payload = value.payload;
+          return {
+            id: stringId(payload.id) || stringId(payload.session_id),
+            parent: stringId(payload.parent_thread_id) || stringId(payload.parentThreadId),
+            cwd: stringId(payload.cwd),
+            timestamp: stringId(value.timestamp) || stringId(payload.timestamp),
+            modelProvider: stringId(payload.model_provider) || stringId(payload.modelProvider),
+            agentNickname: stringId(payload.agent_nickname) || stringId(payload.agentNickname),
+          };
+        }
+        return { id: '', parent: '', cwd: '', timestamp: '', modelProvider: '', agentNickname: '' };
+      }
+
+      // Keep the existing WASM ABI: Codex linkage travels through the optional
+      // Claude-compatible sidecar fields already accepted by replay_from_session.
+      // The core adapter treats this control prefix as a parent thread id.
+      const CODEX_PARENT_PREFIX = '\u001fcodex-parent:';
+
+      function codexWorkflow(meta, rootId) {
+        if (!meta.parent || meta.parent === rootId) return undefined;
+        return CODEX_PARENT_PREFIX + meta.parent;
+      }
+
+      function codexSubagentMeta(record) {
+        const description = record.meta.agentNickname || record.meta.modelProvider;
+        return JSON.stringify(description ? { agentType: 'codex', description } : { agentType: 'codex' });
+      }
+
+      function codexSubagent(record, rootId, transcript) {
+        return {
+          agent_id: record.meta.id || record.name,
+          meta: codexSubagentMeta(record),
+          transcript,
+          workflow: codexWorkflow(record.meta, rootId),
+        };
+      }
+
+      function codexGroupRecords(records) {
+        const byId = new Map();
+        for (const record of records) {
+          if (record.meta.id) byId.set(record.meta.id, record);
+        }
+        const rootFor = (record) => {
+          let current = record;
+          const seen = new Set();
+          while (current.meta.parent && byId.has(current.meta.parent) && !seen.has(current.meta.parent)) {
+            seen.add(current.meta.parent);
+            current = byId.get(current.meta.parent);
+          }
+          return current.meta.id || record.name;
+        };
+        const groups = new Map();
+        for (const record of records) {
+          const key = rootFor(record);
+          const group = groups.get(key) || [];
+          group.push(record);
+          groups.set(key, group);
+        }
+        return [...groups].map(([rootId, members]) => {
+          const main =
+            members.find((record) => record.meta.id === rootId) ||
+            members.find((record) => !record.meta.parent) ||
+            members[0];
+          return {
+            uuid: rootId,
+            main,
+            related: members.filter((record) => record !== main),
+          };
+        });
+      }
+
+      async function groupCodexFiles(files) {
+        const records = [];
+        let scanned = 0;
+        for (const file of files) {
+          if (!CODEX_ROLLOUT_JSONL.test(file.name)) continue;
+          const head = await file.slice(0, 65536).text();
+          if (sniffProvider(head) !== 'codex') continue;
+          records.push({ file, name: file.name, meta: codexMeta(head) });
+          if (++scanned % 20 === 0) {
+            setStatus(`scanning Codex rollouts… ${scanned} files checked`);
+            await yieldToUi();
+          }
+        }
+        return codexGroupRecords(records);
+      }
+
       // Classify an arbitrary set of files (an upload or a drop) into a session:
-      // the main transcript (largest non-`agent-` .jsonl) + its subagents.
+      // Claude uses the largest non-`agent-` .jsonl; Codex uses rollout metadata
+      // to keep one root and its related rollouts together.
       async function buildSession(files) {
+        const codexNames = files.filter((file) => CODEX_ROLLOUT_JSONL.test(file.name));
+        const claudeNames = files.filter((file) => !CODEX_ROLLOUT_JSONL.test(file.name) && file.name.endsWith('.jsonl'));
+        const hasClaude = claudeNames.some((file) => UUID_JSONL.test(file.name));
+        if (selectedProvider === 'auto' && codexNames.length && hasClaude) {
+          return {
+            error:
+              'Both Claude Code and Codex transcripts were found. Select Claude Code or Codex explicitly before opening these files.',
+          };
+        }
+        if (selectedProvider === 'codex' || (selectedProvider === 'auto' && codexNames.length && !claudeNames.some((file) => UUID_JSONL.test(file.name)))) {
+          const groups = await groupCodexFiles(codexNames);
+          if (!groups.length) return { error: 'No supported Codex rollout found in the dropped files.' };
+          groups.sort((a, b) => (b.main.file.lastModified || 0) - (a.main.file.lastModified || 0));
+          const chosen = groups[0];
+          const mainText = await chosen.main.file.text();
+          const detected = validateProvider(mainText, chosen.main.name);
+          if (!detected) return { error: 'The dropped Codex rollout does not match the selected provider.' };
+          const subs = [];
+          for (const related of chosen.related) {
+            subs.push(codexSubagent(related, chosen.uuid, await related.file.text()));
+          }
+          return {
+            provider: 'codex',
+            mainText,
+            mainName: chosen.main.name,
+            subs,
+            relatedCount: subs.length,
+            multiple: groups.length > 1,
+          };
+        }
         const subs = {};
         const sub = (id) => (subs[id] ??= { agent_id: id, meta: '', transcript: '' });
         const mains = [];
@@ -588,7 +854,7 @@ const wasmBase = '/wasm';
         const uuid = mains.filter((f) => UUID_JSONL.test(f.name));
         const main = (uuid.length ? uuid : mains).sort((a, b) => b.size - a.size)[0] || null;
         const mainText = main ? await main.text() : '';
-        return { mainText, mainName: main?.name ?? '', subs: [...Object.values(subs), ...journals] };
+        return { provider: 'claude', mainText, mainName: main?.name ?? '', subs: [...Object.values(subs), ...journals] };
       }
 
       // Recursively collect File objects from a dropped entry (file or directory),
@@ -618,9 +884,18 @@ const wasmBase = '/wasm';
         if (!ready) return;
         const files = Array.from(fileList);
         if (!files.length) return;
-        const { mainText, mainName, subs } = await buildSession(files);
+        const result = await buildSession(files);
+        if (result.error) {
+          setStatus(result.error, true);
+          return;
+        }
+        const { mainText, mainName, subs, provider } = result;
         if (!mainText) {
-          setStatus('No main .jsonl transcript found in the selection.', true);
+          setStatus(`No ${providerSpec().label} transcript found in the selection.`, true);
+          return;
+        }
+        const detected = validateProvider(mainText, mainName);
+        if (!detected || (provider && provider !== detected)) {
           return;
         }
         stopLive();
@@ -631,7 +906,9 @@ const wasmBase = '/wasm';
         // with no subagent files alongside it means the `<uuid>/` folder was left
         // behind — an easy mistake that otherwise renders as a lone main agent
         // with nothing to say it is incomplete.
-        if (!n && SPAWNS_RE.test(mainText)) {
+        if (detected === 'codex') {
+          setStatus(`replaying ${mainName} · Codex · ${n} related rollout${n === 1 ? '' : 's'}`);
+        } else if (!n && SPAWNS_RE.test(mainText)) {
           setStatus(
             `replaying ${mainName} · main agent only — drop its <uuid>/ folder too to see the subagents it spawned`,
           );
@@ -682,18 +959,18 @@ const wasmBase = '/wasm';
       // `.jsonl` files (the terminal signal). `projects/` is descended and then
       // validated by content — never trusted by its name. Returns { repo } for a
       // single repo folder, { repos } for a `projects/` dir with several, or null.
-      async function detect(dir, depth = 0) {
+      async function detectClaude(dir, depth = 0) {
         if (depth > 4) return null;
         // 1. Already a repo transcript folder (has <uuid>.jsonl)?
         const here = await collectSessions(dir);
         if (here) return { repo: { name: dir.name, ...here } };
         // 2. Anchor: descend into `.claude` (from Home or any ancestor).
         const claude = await getDir(dir, '.claude');
-        if (claude) return detect(claude, depth + 1);
+        if (claude) return detectClaude(claude, depth + 1);
         // 3. A `projects/` child: descend, but only accept it if the content checks out.
         const projects = await getDir(dir, 'projects');
         if (projects) {
-          const r = await detect(projects, depth + 1);
+          const r = await detectClaude(projects, depth + 1);
           if (r) return r;
         }
         // 4. This dir's own subdirs are repo folders (e.g. the user picked `projects/`).
@@ -704,18 +981,92 @@ const wasmBase = '/wasm';
         return repos.length ? { repos } : null;
       }
 
+      // Codex keeps rollouts below `$CODEX_HOME/sessions/YYYY/MM/DD`. Restrict
+      // the recursive walk to that date-shaped tree so selecting Home remains
+      // responsive and never scans unrelated files. Authentication files are
+      // not inspected.
+      async function collectCodexRecords(dir, depth = 0, cache = null, path = '', progress = null) {
+        if (depth > 8) return [];
+        const records = [];
+        const scan = progress || { count: 0 };
+        const childDirs = [];
+        for await (const [name, handle] of dir.entries()) {
+          if (handle.kind === 'file' && CODEX_ROLLOUT_JSONL.test(name)) {
+            const key = path ? `${path}/${name}` : name;
+            let meta = cache?.get(key);
+            try {
+              if (!meta) {
+                const head = await (await handle.getFile()).slice(0, 65536).text();
+                if (sniffProvider(head) === 'codex') {
+                  meta = codexMeta(head);
+                  cache?.set(key, meta);
+                }
+              }
+              if (meta) records.push({ handle, name, meta, dir });
+            } catch {
+              // A rollout may still be open for writing; skip this tick.
+            }
+            if (++scan.count % 20 === 0) {
+              setStatus(`scanning Codex sessions… ${scan.count} rollouts checked`);
+              await yieldToUi();
+            }
+          } else if (
+            handle.kind === 'directory' &&
+            (name === 'sessions' || /^\d{4}$/.test(name) || /^\d{2}$/.test(name))
+          ) {
+            childDirs.push([name, handle]);
+          }
+        }
+        for (const [name, handle] of childDirs) {
+          const childPath = path ? `${path}/${name}` : name;
+          records.push(...(await collectCodexRecords(handle, depth + 1, cache, childPath, scan)));
+        }
+        return records;
+      }
+
+      async function detectCodex(dir) {
+        const records = await collectCodexRecords(dir);
+        if (!records.length) return null;
+        const groups = codexGroupRecords(records);
+        const mains = new Map();
+        for (const group of groups) {
+          mains.set(group.uuid, {
+            handle: group.main.handle,
+            related: group.related,
+          });
+        }
+        return {
+          repo: {
+            name: dir.name,
+            mains,
+            dirs: new Map(),
+            provider: 'codex',
+            codexDir: dir,
+          },
+        };
+      }
+
+      async function detect(dir, depth = 0) {
+        if (selectedProvider === 'codex') return detectCodex(dir);
+        if (selectedProvider === 'claude') return detectClaude(dir, depth);
+        const claude = await detectClaude(dir, depth);
+        const codex = await detectCodex(dir);
+        if (claude && codex) return { mixed: true };
+        return claude || codex;
+      }
+
       // Point at anything from Home down to a repo folder; we find the sessions.
       async function openFolder() {
         if (!ready) return;
         // The guidance modal (shown before this) explains how to reach the hidden
-        // ~/.claude/projects target, so here just narrate the picker itself.
+        // provider sessions target, so here just narrate the picker itself.
         setStatus('opening the file picker…');
         let dir;
         try {
           dir = await window.showDirectoryPicker({ id: 'zoetrope-sessions', mode: 'read' });
         } catch (e) {
           if (e && e.name !== 'AbortError')
-            setStatus('Couldn’t open that folder. In the dialog, use ⌘⇧G and go to ~/.claude/projects.', true);
+            setStatus(`Couldn’t open that folder. Choose ${providerSpec().path} in the dialog.`, true);
           else setStatus('demo · use “Sessions” to browse your sessions, or drop a .jsonl');
           return;
         }
@@ -727,8 +1078,15 @@ const wasmBase = '/wasm';
           setStatus('Could not read that folder: ' + (e?.message ?? e), true);
           return;
         }
+        if (found?.mixed) {
+          setStatus(
+            'Both Claude Code and Codex sessions were found. Select Claude Code or Codex explicitly before opening this folder.',
+            true,
+          );
+          return;
+        }
         if (!found) {
-          setStatus('No Claude sessions there. Pick ~/.claude/projects, or a project folder inside it.', true);
+          setStatus(`No ${providerSpec().label} sessions there. Pick ${providerSpec().path}, or a folder inside it.`, true);
           return;
         }
         if (found.repo) {
@@ -755,7 +1113,10 @@ const wasmBase = '/wasm';
       }
 
       async function openRepo(repo) {
-        showSessionPicker(await buildSessionList(repo.mains, repo.dirs), repo.name);
+        showSessionPicker(
+          await buildSessionList(repo.mains, repo.dirs, repo.provider || 'claude', repo.codexDir || null),
+          repo.name,
+        );
       }
 
       // ── webkitdirectory fallback (Firefox/Safari): a flat FileList, so we group
@@ -800,14 +1161,42 @@ const wasmBase = '/wasm';
         return repos;
       }
 
+      async function detectCodexFromFiles(files) {
+        const groups = await groupCodexFiles(files);
+        if (!groups.length) return [];
+        return [
+          {
+            prefix: 'Codex sessions',
+            provider: 'codex',
+            sessions: groups.map((group) => ({
+              uuid: group.uuid,
+              mainFile: group.main.file,
+              relatedFiles: group.related,
+            })),
+          },
+        ];
+      }
+
       async function loadFolderFiles(fileList) {
         if (!ready) return;
         const files = Array.from(fileList);
         if (!files.length) return;
         setStatus('scanning for sessions…');
-        const repos = detectFromFiles(files);
+        const hasCodex = files.some((file) => CODEX_ROLLOUT_JSONL.test(file.name));
+        const hasClaude = files.some((file) => UUID_JSONL.test(file.name));
+        if (selectedProvider === 'auto' && hasCodex && hasClaude) {
+          setStatus(
+            'Both Claude Code and Codex transcripts were found. Select Claude Code or Codex explicitly before opening this folder.',
+            true,
+          );
+          return;
+        }
+        const repos =
+          selectedProvider === 'codex' || (selectedProvider === 'auto' && hasCodex && !hasClaude)
+            ? await detectCodexFromFiles(files)
+            : detectFromFiles(files);
         if (!repos.length) {
-          setStatus('No Claude sessions in that folder. Choose ~/.claude/projects, or a project inside it.', true);
+          setStatus(`No ${providerSpec().label} sessions in that folder. Choose ${providerSpec().path}, or a folder inside it.`, true);
           return;
         }
         if (repos.length === 1) openFileRepo(repos[0]);
@@ -833,12 +1222,19 @@ const wasmBase = '/wasm';
             lastModified = s.mainFile.lastModified;
             size = s.mainFile.size;
             title = await previewTitle(s.mainFile);
+            if (r.provider === 'codex') {
+              for (const related of s.relatedFiles || []) {
+                lastModified = Math.max(lastModified, related.file.lastModified || 0);
+              }
+            }
           } catch {}
           sessions.push({
             uuid: s.uuid,
             mainFile: s.mainFile,
-            subFiles: Object.values(s.subFiles),
-            journalFiles: s.journalFiles,
+            subFiles: Object.values(s.subFiles || {}),
+            journalFiles: s.journalFiles || {},
+            provider: r.provider || 'claude',
+            codexRollouts: s.relatedFiles || [],
             lastModified,
             size,
             title,
@@ -850,9 +1246,10 @@ const wasmBase = '/wasm';
 
       // Session rows: recency (free) + a title preview (small read). Newest first;
       // the newest, if written in the last minute, is the active/live session.
-      async function buildSessionList(mains, dirs) {
+      async function buildSessionList(mains, dirs, provider = 'claude', codexDir = null) {
         const sessions = [];
-        for (const [uuid, mainHandle] of mains) {
+        for (const [uuid, value] of mains) {
+          const mainHandle = provider === 'codex' ? value.handle : value;
           let lastModified = 0,
             size = 0,
             title = '';
@@ -861,8 +1258,26 @@ const wasmBase = '/wasm';
             lastModified = file.lastModified;
             size = file.size;
             title = await previewTitle(file);
+            if (provider === 'codex') {
+              for (const related of value.related || []) {
+                try {
+                  const child = await related.handle.getFile();
+                  lastModified = Math.max(lastModified, child.lastModified || 0);
+                } catch {}
+              }
+            }
           } catch {}
-          sessions.push({ uuid, mainHandle, dirHandle: dirs.get(uuid) || null, lastModified, size, title });
+          sessions.push({
+            uuid,
+            mainHandle,
+            dirHandle: provider === 'codex' ? null : dirs.get(uuid) || null,
+            provider,
+            codexRollouts: provider === 'codex' ? value.related || [] : [],
+            codexDirHandle: provider === 'codex' ? codexDir : null,
+            lastModified,
+            size,
+            title,
+          });
         }
         sessions.sort((a, b) => b.lastModified - a.lastModified);
         if (sessions[0] && Date.now() - sessions[0].lastModified < 60000) sessions[0].live = true;
@@ -904,14 +1319,23 @@ const wasmBase = '/wasm';
         try {
           const head = await file.slice(0, 65536).text();
           for (const line of head.split('\n')) {
-            if (!line || !line.includes('"type":"user"')) continue;
+            if (!line) continue;
             let o;
             try {
               o = JSON.parse(line);
             } catch {
               continue;
             }
-            const c = o && o.type === 'user' && o.message && o.message.content;
+            let c = o && o.type === 'user' && o.message && o.message.content;
+            if (o?.type === 'event_msg' && o.payload?.type === 'user_message') c = o.payload.message;
+            if (o?.type === 'response_item' && o.payload?.role === 'user') {
+              c = o.payload.content;
+            }
+            if (Array.isArray(c)) {
+              c = c
+                .map((part) => (typeof part === 'string' ? part : part?.text || part?.input_text || ''))
+                .join(' ');
+            }
             if (typeof c === 'string' && c.trim() && (!o.origin || o.origin.kind === 'human')) {
               return c.replace(/\s+/g, ' ').trim().slice(0, 90);
             }
@@ -946,7 +1370,8 @@ const wasmBase = '/wasm';
           const meta = document.createElement('span');
           meta.className = 's-meta';
           const badge = s.live ? '<span class="dot">●</span> live · ' : '';
-          meta.innerHTML = badge + escapeHtml(`${relTime(s.lastModified)} · ${fmtSize(s.size)} · ${s.uuid.slice(0, 8)}`);
+          const provider = s.provider && PROVIDERS[s.provider] ? `${PROVIDERS[s.provider].label} · ` : '';
+          meta.innerHTML = badge + escapeHtml(`${provider}${relTime(s.lastModified)} · ${fmtSize(s.size)} · ${s.uuid.slice(0, 8)}`);
           row.append(title, meta);
           row.addEventListener('click', () => {
             closeSessionPicker();
@@ -1027,6 +1452,18 @@ const wasmBase = '/wasm';
         try {
           // webkitdirectory session (plain File objects) — replay only.
           if (s.mainFile) {
+            const mainText = await s.mainFile.text();
+            const detected = validateProvider(mainText, s.mainFile.name);
+            if (!detected) return;
+            if (s.provider === 'codex') {
+              const subs = [];
+              for (const related of s.codexRollouts || []) {
+                subs.push(codexSubagent(related, s.uuid, await related.file.text()));
+              }
+              zoetrope_load(mainText, JSON.stringify(subs), false);
+              setStatus(`replaying ${label} · Codex · ${subs.length} related rollout${subs.length === 1 ? '' : 's'}`);
+              return;
+            }
             const subs = [];
             for (const sub of s.subFiles) {
               subs.push({
@@ -1039,7 +1476,7 @@ const wasmBase = '/wasm';
             for (const [wfId, f] of Object.entries(s.journalFiles ?? {})) {
               subs.push({ agent_id: '', meta: '', transcript: await f.text(), workflow: wfId, journal: true });
             }
-            zoetrope_load(await s.mainFile.text(), JSON.stringify(subs), false);
+            zoetrope_load(mainText, JSON.stringify(subs), false);
             setStatus(`replaying ${label} · ${subs.length} subagent${subs.length === 1 ? '' : 's'}`);
             return;
           }
@@ -1050,7 +1487,49 @@ const wasmBase = '/wasm';
               subagentsDir = await s.dirHandle.getDirectoryHandle('subagents');
             } catch {}
           }
-          const mainText = await (await s.mainHandle.getFile()).text();
+          const mainFile = await s.mainHandle.getFile();
+          const mainText = await mainFile.text();
+          const detected = validateProvider(mainText, s.uuid + '.jsonl');
+          if (!detected) return;
+
+          if (s.provider === 'codex') {
+            const codexRollouts = s.codexRollouts || [];
+            if (live) {
+              const state = {
+                provider: 'codex',
+                mainHandle: s.mainHandle,
+                mainName: s.uuid,
+                rootId: s.uuid,
+                codexDirHandle: s.codexDirHandle,
+                codexRecords: new Map(),
+                codexRollouts,
+                subs: {},
+                mainConsumed: 0,
+              };
+              const m = freshLines(mainText, 0);
+              state.mainConsumed = m.consumed;
+              const subsInit = [];
+              for (const related of codexRollouts) {
+                const text = await (await related.handle.getFile()).text();
+                const r = freshLines(text, 0);
+                const id = related.meta.id || related.name;
+                subsInit.push(codexSubagent(related, state.rootId, r.fresh));
+                state.subs[id] = { handle: related.handle, consumed: r.consumed, metaSent: true };
+              }
+              zoetrope_load(m.fresh, JSON.stringify(subsInit), true);
+              liveState = state;
+              setStatus(`live · ${label} · Codex · ${subsInit.length} related rollout${subsInit.length === 1 ? '' : 's'}`, false, true);
+              liveTimer = setTimeout(pollLive, 1000);
+            } else {
+              const subs = [];
+              for (const related of codexRollouts) {
+                subs.push(codexSubagent(related, s.uuid, await (await related.handle.getFile()).text()));
+              }
+              zoetrope_load(mainText, JSON.stringify(subs), false);
+              setStatus(`replaying ${label} · Codex · ${subs.length} related rollout${subs.length === 1 ? '' : 's'}`);
+            }
+            return;
+          }
 
           if (live) {
             const state = { mainHandle: s.mainHandle, mainName: s.uuid, subagentsDir, subs: {}, journals: {}, mainConsumed: 0 };
@@ -1118,7 +1597,42 @@ const wasmBase = '/wasm';
           }
 
           const subsOut = [];
-          if (s.subagentsDir) {
+          if (s.provider === 'codex') {
+            // Codex can create child rollouts after the root is opened. Rewalk
+            // the selected sessions tree on every tick, while caching the
+            // immutable session headers so a large history does not cause a
+            // 64 KiB read for every rollout each second.
+            if (s.codexDirHandle) {
+              const records = await collectCodexRecords(s.codexDirHandle, 0, s.codexRecords);
+              const groups = codexGroupRecords(records);
+              const group =
+                groups.find((candidate) => candidate.uuid === s.rootId) ||
+                groups.find((candidate) => (candidate.main.meta.id || candidate.main.name) === s.rootId);
+              if (group) {
+                s.codexRollouts = group.related;
+                for (const related of s.codexRollouts) {
+                  const id = related.meta.id || related.name;
+                  const entry = (s.subs[id] ??= { handle: related.handle, consumed: 0, metaSent: false });
+                  entry.handle = related.handle;
+                }
+              }
+            }
+            for (const related of s.codexRollouts || []) {
+              const id = related.meta.id || related.name;
+              const entry = (s.subs[id] ??= { handle: related.handle, consumed: 0, metaSent: false });
+              entry.handle = related.handle;
+              const text = await (await entry.handle.getFile()).text();
+              const r = freshLines(text, entry.consumed);
+              const meta = entry.metaSent ? '' : codexSubagentMeta(related);
+              if (r.fresh || meta) {
+                const payload = codexSubagent(related, s.rootId, r.fresh);
+                payload.meta = meta;
+                subsOut.push(payload);
+                entry.consumed = r.consumed;
+                entry.metaSent = true;
+              }
+            }
+          } else if (s.subagentsDir) {
             for await (const [name, handle] of s.subagentsDir.entries()) {
               if (handle.kind !== 'file' || !name.startsWith('agent-') || !name.endsWith('.jsonl')) continue;
               const id = name.slice(6, -'.jsonl'.length);
@@ -1184,6 +1698,16 @@ const wasmBase = '/wasm';
         location.reload();
       });
 
+      providerSelect.addEventListener('change', () => {
+        selectedProvider = providerSelect.value;
+        stopLive();
+        lastSessions = null;
+        lastRepoName = '';
+        updateProviderCopy();
+        setStatus(`${providerSpec().label} selected · choose Sessions or drop a transcript`);
+      });
+      updateProviderCopy();
+
       // Pick a folder: the File System Access API when available (browse + live),
       // else the webkitdirectory input (browse, replay). Both land on the same
       // session picker, so it works in every browser.
@@ -1218,7 +1742,7 @@ const wasmBase = '/wasm';
       });
       copyPath.addEventListener('click', async () => {
         try {
-          await navigator.clipboard.writeText('~/.claude/projects');
+          await navigator.clipboard.writeText(copyPath.dataset.path || providerSpec().path);
           copyPath.textContent = 'copied';
           setTimeout(() => (copyPath.textContent = 'copy'), 1200);
         } catch {
