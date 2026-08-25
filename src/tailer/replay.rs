@@ -103,6 +103,7 @@ pub(crate) async fn run_replay(
 /// relative order. Missing-timestamp entries inherit the previous entry's
 /// timestamp *within their own file* before the merge sort, so they ride along
 /// with their predecessor.
+#[allow(dead_code)]
 pub(crate) fn build_replay(
     main_path: &Path,
 ) -> (Vec<ReplayItem>, crate::state::SessionInfo, SnapshotSeed) {

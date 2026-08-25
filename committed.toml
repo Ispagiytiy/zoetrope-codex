@@ -3,7 +3,7 @@
 # https://www.conventionalcommits.org
 style = "conventional"
 # allow merge commits
-merge_commit = true
+merge_commit = false
 # subject is not required to be capitalized
 subject_capitalized = false
 # subject should start with an imperative verb
