@@ -173,6 +173,7 @@ impl LiveSession {
 /// `<uuid>.jsonl` under it) or a concrete session file (its parent is the
 /// project dir). Returns `None` if the target is a directory with no session
 /// file yet — the caller polls until one appears.
+#[allow(dead_code)]
 pub(crate) fn resolve_live_target(target: &Path) -> Option<(PathBuf, PathBuf)> {
     resolve_live_target_for_provider(target, ProviderKind::Claude)
 }
@@ -190,7 +191,7 @@ pub(crate) fn resolve_live_target_for_provider(
         } else {
             transcript::latest_session_file(target).or_else(|| {
                 (provider == ProviderKind::Auto)
-                    .then(|| transcript::codex_sessions_root())
+                    .then(transcript::codex_sessions_root)
                     .flatten()
                     .and_then(|root| transcript::latest_codex_session_file(&root))
             })?
