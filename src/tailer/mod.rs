@@ -21,6 +21,7 @@ use std::path::PathBuf;
 #[cfg(feature = "native")]
 use tokio::sync::mpsc;
 
+use crate::provider::ProviderKind;
 use crate::transcript::{Entry, SubagentMeta};
 
 // Portable: the timeline item + its ordering (no IO → compiles on wasm).
@@ -57,6 +58,20 @@ pub enum TailRequest {
     /// discovers the session file under the project dir; in replay it is the
     /// explicit transcript path.
     Watch(PathBuf),
+    /// Provider-aware watch request. The legacy variant remains accepted for
+    /// embedders and means `auto`.
+    WatchWithProvider {
+        path: PathBuf,
+        provider: ProviderKind,
+    },
+}
+
+/// A resolved watch target carried between the feeder loops.
+#[cfg(feature = "native")]
+#[derive(Debug, Clone)]
+pub(crate) struct WatchTarget {
+    pub(crate) path: PathBuf,
+    pub(crate) provider: ProviderKind,
 }
 
 /// Events the tailer task sends to the UI.
@@ -126,7 +141,7 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     // Wait for the first Watch before doing anything (Watch is the only request).
     let mut current = match wait_for_watch(&mut req_rx).await {
-        Some(path) => path,
+        Some(target) => target,
         None => return Ok(()),
     };
 
@@ -138,7 +153,7 @@ pub async fn run(
         };
 
         match next {
-            Flow::Switch(path) => current = path,
+            Flow::Switch(target) => current = target,
             Flow::Exit => return Ok(()),
         }
     }
@@ -148,15 +163,19 @@ pub async fn run(
 #[cfg(feature = "native")]
 pub(crate) enum Flow {
     /// Switch to a new file (live auto-switch or a `Watch` request).
-    Switch(PathBuf),
+    Switch(WatchTarget),
     /// The request channel closed — shut down.
     Exit,
 }
 
 /// Block until the first [`TailRequest::Watch`].
 #[cfg(feature = "native")]
-async fn wait_for_watch(req_rx: &mut mpsc::Receiver<TailRequest>) -> Option<PathBuf> {
+async fn wait_for_watch(req_rx: &mut mpsc::Receiver<TailRequest>) -> Option<WatchTarget> {
     match req_rx.recv().await? {
-        TailRequest::Watch(path) => Some(path),
+        TailRequest::Watch(path) => Some(WatchTarget {
+            path,
+            provider: ProviderKind::Auto,
+        }),
+        TailRequest::WatchWithProvider { path, provider } => Some(WatchTarget { path, provider }),
     }
 }
