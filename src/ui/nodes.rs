@@ -33,7 +33,7 @@ pub const CELL_MIN_HEIGHT: u16 = 3;
 /// place during incremental sync (mirroring [`crate::state::session::AgentInfo`]).
 #[derive(Debug, Clone)]
 pub struct AgentNode {
-    /// Title line — agent type, or `"claude"` for the main agent.
+    /// Title line — agent type, or `"main"` for the main agent.
     pub title: String,
     /// Truncated description shown under the title.
     pub description: Option<String>,
@@ -237,7 +237,7 @@ mod tests {
         use rataflow::types::Position;
 
         let node = AgentNode {
-            title: "claude".into(),
+            title: "main".into(),
             description: None,
             status: AgentStatus::Done,
             tool_count: 3,
@@ -264,10 +264,7 @@ mod tests {
         let area = ratatui::layout::Rect::new(0, 0, 24, 6);
         let buf = render_into(area);
         let text: String = (0..area.width).map(|x| buf[(x, 1)].symbol()).collect();
-        assert!(
-            text.contains("claude"),
-            "card level must show title: {text}"
-        );
+        assert!(text.contains("main"), "card level must show title: {text}");
     }
 
     #[test]
