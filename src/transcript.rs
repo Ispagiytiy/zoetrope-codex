@@ -1372,10 +1372,13 @@ pub fn bounded_jsonl_lines(
     // `BufRead::lines` also returns a final newline-less record. Only accept it
     // when EOF was reached naturally; a byte-capped partial record is unsafe
     // to classify and remains skipped.
-    if reached_eof && !line.is_empty() && !oversized && records < max_lines {
-        if let Ok(text) = std::str::from_utf8(&line) {
-            lines.push(text.to_owned());
-        }
+    if reached_eof
+        && !line.is_empty()
+        && !oversized
+        && records < max_lines
+        && let Ok(text) = std::str::from_utf8(&line)
+    {
+        lines.push(text.to_owned());
     }
     Some(lines)
 }
