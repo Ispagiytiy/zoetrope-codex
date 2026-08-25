@@ -206,6 +206,7 @@ fn fold_meta(model: &mut SessionModel, path: &Path, agent_id: &str, workflow: Op
 /// journals) into a [`SessionModel`], reading every sidecar discovered next to
 /// the main transcript. Shared by `inspect`; the live/replay path uses the
 /// tailer instead.
+#[allow(dead_code)]
 fn parse_session_fully(main_file: &Path) -> Result<SessionModel> {
     parse_session_fully_with_provider(main_file, ProviderKind::Auto)
 }
