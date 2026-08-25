@@ -12,10 +12,11 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use crate::provider::ProviderKind;
 use crate::transcript::{self, SubagentMeta};
 
 use super::bytes::{ReadResult, TailState, read_appended};
-use super::{Flow, Source, TailRequest, UiEvent, Update};
+use super::{Flow, Source, TailRequest, UiEvent, Update, WatchTarget};
 
 /// Poll interval for live tailing.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -34,6 +35,9 @@ const SWITCH_IDLE_TICKS: u32 = 150;
 
 /// Tracks all files belonging to one live session.
 pub(crate) struct LiveSession {
+    /// Provider selected for discovery. The parser itself remains defensive
+    /// `auto`, but directory/child rollout discovery needs this explicit bit.
+    pub(crate) provider: ProviderKind,
     /// Project directory containing the main file (for newer-session scans).
     pub(crate) project_dir: Option<PathBuf>,
     /// The main `<uuid>.jsonl` path.
@@ -58,6 +62,9 @@ pub(crate) struct LiveSession {
     /// snapshot stopped reading instead of at the live EOF (which would drop
     /// lines appended during the bulk parse).
     seed_offsets: HashMap<PathBuf, u64>,
+    /// Codex record ids already emitted in this attachment. Child rollouts may
+    /// repeat a parent prefix; anonymous records are intentionally not filtered.
+    seen_codex_ids: std::collections::HashSet<String>,
 }
 
 /// Per-file read positions and already-emitted metas captured by the replay
@@ -76,9 +83,10 @@ impl LiveSession {
     /// the watched directory (NOT `main_path.parent()`, which for a workflow or
     /// nested layout would be wrong — they are the same here, but threading the
     /// project dir explicitly keeps auto-switch correct).
-    pub(crate) fn new(project_dir: PathBuf, main_path: PathBuf) -> Self {
+    pub(crate) fn new(project_dir: PathBuf, main_path: PathBuf, provider: ProviderKind) -> Self {
         let subagents_dir = transcript::subagents_dir(&main_path).unwrap_or_default();
         Self {
+            provider,
             project_dir: Some(project_dir),
             main_path,
             subagents_dir,
@@ -88,6 +96,7 @@ impl LiveSession {
             ticks: 0,
             idle_ticks: 0,
             seed_offsets: HashMap::new(),
+            seen_codex_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -120,6 +129,37 @@ impl LiveSession {
         }
         self.tracked.insert(path, (source, state));
     }
+
+    /// Register metadata embedded in a Codex rollout's `session_meta` record.
+    /// The transcript itself is still tracked separately; this virtual sidecar
+    /// is emitted once so the graph gets the parent edge before child events.
+    fn track_codex_meta(
+        &mut self,
+        path: &Path,
+        agent_id: String,
+        parent: Option<String>,
+        meta: &transcript::CodexSessionMeta,
+        updates: &mut Vec<Update>,
+    ) -> bool {
+        if self.seen_meta.contains(path) {
+            return false;
+        }
+        self.seen_meta.insert(path.to_path_buf());
+        updates.push(Update::SubagentMeta {
+            agent_id,
+            workflow: parent,
+            meta: SubagentMeta {
+                agent_type: Some("codex".to_owned()),
+                description: meta
+                    .agent_nickname
+                    .clone()
+                    .or_else(|| meta.model_provider.clone()),
+                tool_use_id: None,
+                stopped_by_user: None,
+            },
+        });
+        true
+    }
 }
 
 /// Resolve a live watch target into `(project_dir, main_file)`.
@@ -129,8 +169,27 @@ impl LiveSession {
 /// project dir). Returns `None` if the target is a directory with no session
 /// file yet — the caller polls until one appears.
 pub(crate) fn resolve_live_target(target: &Path) -> Option<(PathBuf, PathBuf)> {
+    resolve_live_target_for_provider(target, ProviderKind::Claude)
+}
+
+/// Provider-aware live target resolution. `Auto` preserves Claude precedence
+/// when a Claude project has a session; otherwise it may select the newest
+/// Codex rollout below the configured sessions root.
+pub(crate) fn resolve_live_target_for_provider(
+    target: &Path,
+    provider: ProviderKind,
+) -> Option<(PathBuf, PathBuf)> {
     if target.is_dir() {
-        let main = transcript::latest_session_file(target)?;
+        let main = if provider == ProviderKind::Codex {
+            transcript::latest_codex_session_file(target)?
+        } else {
+            transcript::latest_session_file(target).or_else(|| {
+                (provider == ProviderKind::Auto)
+                    .then(|| transcript::codex_sessions_root())
+                    .flatten()
+                    .and_then(|root| transcript::latest_codex_session_file(&root))
+            })?
+        };
         Some((target.to_path_buf(), main))
     } else {
         let project_dir = target.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -143,17 +202,33 @@ pub(crate) fn resolve_live_target(target: &Path) -> Option<(PathBuf, PathBuf)> {
 /// file, or a [`Flow`] outcome if a switch/exit request arrives first.
 async fn await_first_session(
     project_dir: &Path,
+    provider: ProviderKind,
     req_rx: &mut mpsc::Receiver<TailRequest>,
 ) -> Result<PathBuf, Flow> {
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        if let Some(main) = transcript::latest_session_file(project_dir) {
+        let latest = if provider == ProviderKind::Codex {
+            transcript::latest_codex_session_file(project_dir)
+        } else {
+            transcript::latest_session_file(project_dir).or_else(|| {
+                (provider == ProviderKind::Auto)
+                    .then(|| transcript::latest_codex_session_file(project_dir))
+                    .flatten()
+            })
+        };
+        if let Some(main) = latest {
             return Ok(main);
         }
         tokio::select! {
             req = req_rx.recv() => match req {
-                Some(TailRequest::Watch(p)) => return Err(Flow::Switch(p)),
+                Some(TailRequest::Watch(p)) => return Err(Flow::Switch(WatchTarget {
+                    path: p,
+                    provider: crate::provider::ProviderKind::Auto,
+                })),
+                Some(TailRequest::WatchWithProvider { path, provider }) => {
+                    return Err(Flow::Switch(WatchTarget { path, provider }))
+                }
                 None => return Err(Flow::Exit),
             },
             _ = ticker.tick() => {}
@@ -166,7 +241,7 @@ async fn await_first_session(
 /// `target` is either a project directory (the session file is discovered, and
 /// re-discovered for newer sessions) or a concrete `<uuid>.jsonl` file.
 pub(crate) async fn run_live(
-    target: &Path,
+    target: &WatchTarget,
     ui_tx: &mpsc::Sender<UiEvent>,
     req_rx: &mut mpsc::Receiver<TailRequest>,
 ) -> Flow {
@@ -174,19 +249,24 @@ pub(crate) async fn run_live(
     // session yet, wait for the first one to appear. A concrete FILE target
     // PINS to that session (no auto-switch — you named the file you want); only
     // a directory target follows the newest session in it.
-    let pin = !target.is_dir();
-    let (project_dir, main_path) = match resolve_live_target(target) {
+    let path = &target.path;
+    let pin = !path.is_dir();
+    let provider = match target.provider {
+        ProviderKind::Auto if transcript::is_codex_session_file(path) => ProviderKind::Codex,
+        selected => selected,
+    };
+    let (project_dir, main_path) = match resolve_live_target_for_provider(path, provider) {
         Some(pair) => pair,
         None => {
             // Directory with no session file yet — poll until one shows up.
-            match await_first_session(target, req_rx).await {
-                Ok(main) => (target.to_path_buf(), main),
+            match await_first_session(path, provider, req_rx).await {
+                Ok(main) => (path.to_path_buf(), main),
                 Err(flow) => return flow,
             }
         }
     };
 
-    let mut session = LiveSession::new(project_dir, main_path);
+    let mut session = LiveSession::new(project_dir, main_path, provider);
     if pin {
         session.project_dir = None;
     }
@@ -228,13 +308,19 @@ pub(crate) async fn tail_loop(
         tokio::select! {
             req = req_rx.recv() => {
                 match req {
-                    Some(TailRequest::Watch(new_path)) => return Flow::Switch(new_path),
+                    Some(TailRequest::Watch(new_path)) => return Flow::Switch(WatchTarget {
+                        path: new_path,
+                        provider: crate::provider::ProviderKind::Auto,
+                    }),
+                    Some(TailRequest::WatchWithProvider { path, provider }) => {
+                        return Flow::Switch(WatchTarget { path, provider })
+                    }
                     None => return Flow::Exit,
                 }
             }
             _ = ticker.tick() => {
                 if let Some(switch) = poll_live(&mut session, &session_id, ui_tx).await {
-                    return Flow::Switch(switch);
+                    return Flow::Switch(WatchTarget { path: switch, provider: session.provider });
                 }
             }
         }
@@ -268,6 +354,12 @@ async fn poll_live(
         }
         ReadResult::Entries(entries) => {
             for entry in entries {
+                if session.provider == ProviderKind::Codex
+                    && let Some(id) = transcript::entry_identity(&entry)
+                    && !session.seen_codex_ids.insert(id.to_owned())
+                {
+                    continue;
+                }
                 updates.push(Update::Entry {
                     source: Source::Main,
                     entry,
@@ -281,7 +373,12 @@ async fn poll_live(
     scan_files(session, &mut updates);
 
     // --- read each tracked non-main file ---
-    if read_tracked(&mut session.tracked, &mut updates) {
+    if read_tracked(
+        &mut session.tracked,
+        &mut updates,
+        session.provider,
+        &mut session.seen_codex_ids,
+    ) {
         // A tracked file was truncated/rotated: its already-applied content is
         // baked into the App model, so re-reading it in place would duplicate
         // items and double-count tokens. Re-attach the whole session, same as
@@ -319,7 +416,11 @@ async fn poll_live(
     if session.ticks.is_multiple_of(SWITCH_SCAN_EVERY)
         && session.idle_ticks >= SWITCH_IDLE_TICKS
         && let Some(dir) = &session.project_dir
-        && let Some(latest) = transcript::latest_session_file(dir)
+        && let Some(latest) = if session.provider == ProviderKind::Codex {
+            transcript::latest_codex_session_file(dir)
+        } else {
+            transcript::latest_session_file(dir)
+        }
         && latest != session.main_path
     {
         // Stamp the reset with the NEW session id so the UI adopts the id the
@@ -342,12 +443,20 @@ async fn poll_live(
 fn read_tracked(
     tracked: &mut HashMap<PathBuf, (Source, TailState)>,
     updates: &mut Vec<Update>,
+    provider: ProviderKind,
+    seen_codex_ids: &mut std::collections::HashSet<String>,
 ) -> bool {
     let mut reset = false;
     for (path, (source, state)) in tracked.iter_mut() {
         match read_appended(path, state) {
             ReadResult::Entries(entries) => {
                 for entry in entries {
+                    if provider == ProviderKind::Codex
+                        && let Some(id) = transcript::entry_identity(&entry)
+                        && !seen_codex_ids.insert(id.to_owned())
+                    {
+                        continue;
+                    }
                     updates.push(Update::Entry {
                         source: source.clone(),
                         entry,
@@ -366,6 +475,26 @@ fn read_tracked(
 /// emitting each meta sidecar once. Direct and workflow subagents share one
 /// path-keyed map; each workflow journal is tracked too.
 fn scan_files(session: &mut LiveSession, updates: &mut Vec<Update>) {
+    if session.provider == ProviderKind::Codex {
+        let root_id =
+            transcript::codex_session_meta(&session.main_path).map(|meta| meta.session_id);
+        for file in transcript::scan_codex_session_files(&session.main_path) {
+            if file.path == session.main_path {
+                continue;
+            }
+            let Some(meta) = file.meta else { continue };
+            let parent = meta
+                .parent_thread_id
+                .as_deref()
+                .filter(|parent| root_id.as_deref() != Some(*parent))
+                .map(|parent| format!("{}{}", transcript::CODEX_PARENT_PREFIX, parent));
+            let agent_id = meta.session_id.clone();
+            if session.track_codex_meta(&file.path, agent_id.clone(), parent, &meta, updates) {
+                session.track(file.path, Source::Sub(agent_id));
+            }
+        }
+        return;
+    }
     let subagents = session.subagents_dir.clone();
     // Direct subagents under `subagents/`.
     for f in transcript::scan_subagent_files(&subagents, None) {
@@ -484,7 +613,7 @@ mod tests {
         std::fs::write(&a, "").unwrap();
         std::fs::write(&b, "").unwrap();
 
-        let mut session = LiveSession::new(dir.clone(), a.clone());
+        let mut session = LiveSession::new(dir.clone(), a.clone(), ProviderKind::Claude);
         // Quiet long enough to switch, and aligned to the throttled scan tick.
         session.idle_ticks = SWITCH_IDLE_TICKS;
         session.ticks = SWITCH_SCAN_EVERY - 1;
@@ -544,7 +673,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut session = LiveSession::new(dir.clone(), main.clone());
+        let mut session = LiveSession::new(dir.clone(), main.clone(), ProviderKind::Claude);
         session.project_dir = None;
         session.seed(seed);
 
@@ -585,7 +714,7 @@ mod tests {
         )).unwrap();
 
         let (tx, mut rx) = mpsc::channel(32);
-        let mut session = LiveSession::new(dir.clone(), main.clone());
+        let mut session = LiveSession::new(dir.clone(), main.clone(), ProviderKind::Claude);
         assert!(poll_live(&mut session, "55555555", &tx).await.is_none()); // backfill
 
         // Truncate the SUBAGENT file: already-applied content would be
@@ -622,7 +751,7 @@ mod tests {
         std::fs::write(&main, b"{\"type\":\"user\",\"uuid\":\"u1\",\"parentUuid\":null,\"message\":{\"role\":\"user\",\"content\":\"abcdef\"}}\n").unwrap();
 
         let (tx, mut rx) = mpsc::channel(32);
-        let mut session = LiveSession::new(dir.clone(), main.clone());
+        let mut session = LiveSession::new(dir.clone(), main.clone(), ProviderKind::Claude);
         poll_live(&mut session, "33333333", &tx).await; // backfill
 
         // Truncate in place (shorter content) — must return the SAME path so

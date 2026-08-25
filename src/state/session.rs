@@ -477,6 +477,16 @@ impl SessionModel {
                         }
                     }
                 }
+                // Codex task lifecycle records are normalized to the same
+                // notification shape but live in the child rollout itself.
+                // Claude's historical path above remains unchanged; this
+                // branch lets a child terminal event settle its own node.
+                if matches!(source, Source::Sub(_))
+                    && let Some(text) = e.prompt_text()
+                    && let Some(tn) = crate::transcript::parse_task_notification(text)
+                {
+                    self.apply_task_notification(&tn);
+                }
                 // tool_result blocks complete tool calls (and, in the main
                 // transcript, direct-subagent + workflow nodes).
                 if let Some(msg) = &e.message
@@ -528,6 +538,15 @@ impl SessionModel {
             if let Some(usage) = &msg.usage
                 && let Some(out) = usage.output_tokens
             {
+                // Codex emits cumulative `token_count` snapshots rather than
+                // per-turn usage. Its normalized entry carries this marker so
+                // repeated snapshots update a high-water mark instead of
+                // inflating the total. Claude's request-id accounting below is
+                // unchanged.
+                if e.envelope.request_id.as_deref() == Some("codex-token-total") {
+                    agent.output_tokens = agent.output_tokens.max(out);
+                    return;
+                }
                 // One assistant turn spans multiple lines that each repeat the
                 // same cumulative usage; count it once per `requestId`. Lines
                 // with no `requestId` can't be deduped, so they sum per line.
@@ -791,6 +810,17 @@ impl SessionModel {
         let mut structural = false;
         // Workflow subagents live under a group node; ensure it exists first.
         let parent = match workflow {
+            Some(encoded) if encoded.starts_with(crate::transcript::CODEX_PARENT_PREFIX) => {
+                let parent = encoded.trim_start_matches(crate::transcript::CODEX_PARENT_PREFIX);
+                if parent.is_empty() {
+                    MAIN_ID.to_string()
+                } else {
+                    // Codex parent ids are thread ids, while the root node uses
+                    // the stable canonical `main` id. Child ids remain their
+                    // rollout session ids and therefore join transitively.
+                    parent.to_string()
+                }
+            }
             Some(wf_id) => {
                 structural |= self.ensure_agent(wf_id, AgentKind::WorkflowGroup);
                 if let Some(group) = self.agents.get_mut(wf_id)
@@ -1092,6 +1122,13 @@ fn summarize_tool(name: &str, input: &serde_json::Value, cwd: Option<&str>) -> O
     };
     match name {
         "Bash" => pick("command").or_else(|| pick("description")),
+        "exec" | "exec_command" => pick("cmd")
+            .or_else(|| pick("command"))
+            .or_else(|| pick("description"))
+            .or_else(|| input.as_str().map(truncate_summary)),
+        "apply_patch" | "patch" => pick("patch")
+            .or_else(|| pick("description"))
+            .or_else(|| input.as_str().map(truncate_summary)),
         "Read" | "Write" | "Edit" => pick_path("file_path").or_else(|| pick_path("path")),
         n if crate::transcript::is_spawn_tool(n) => {
             // Prefer the typed view for description/subagent_type.
@@ -2315,5 +2352,23 @@ mod tests {
         // async spawn-ack was superseded by its own activity, or it never got a
         // reliable completion) — settle it to Done rather than leave it "live".
         assert_eq!(m.agent("sub1").unwrap().status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn codex_parent_marker_preserves_nested_thread_identity() {
+        let mut m = SessionModel::new("root-thread".into());
+        let meta = crate::transcript::SubagentMeta {
+            agent_type: Some("codex".into()),
+            description: Some("child".into()),
+            tool_use_id: None,
+            stopped_by_user: None,
+        };
+        m.apply_meta("child", None, &meta);
+        m.apply_meta("grandchild", Some("\u{1f}codex-parent:child"), &meta);
+        assert_eq!(m.agent("child").unwrap().parent.as_deref(), Some(MAIN_ID));
+        assert_eq!(
+            m.agent("grandchild").unwrap().parent.as_deref(),
+            Some("child")
+        );
     }
 }

@@ -177,7 +177,10 @@ impl Entry {
 /// source for the rule — `Task` is Claude Code's legacy name for the `Agent`
 /// tool, so all three count as spawns (provenance, scrubber markers, summaries).
 pub fn is_spawn_tool(name: &str) -> bool {
-    matches!(name, "Agent" | "Task" | "Workflow")
+    matches!(
+        name,
+        "Agent" | "Task" | "Workflow" | "spawn_agent" | "spawn_agent_task"
+    )
 }
 
 /// Session id from a transcript path: the file stem (`<uuid>.jsonl` → `<uuid>`),
@@ -186,6 +189,20 @@ pub fn session_id_from_path(path: &std::path::Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// Stable record identity when a provider envelope exposes one. Codex child
+/// rollouts can contain a copied prefix of their parent's history; replay uses
+/// this key to suppress only exact duplicates while leaving anonymous records
+/// untouched.
+pub fn entry_identity(entry: &Entry) -> Option<&str> {
+    match entry {
+        Entry::User(e) => e.envelope.uuid.as_deref(),
+        Entry::Assistant(e) => e.envelope.uuid.as_deref(),
+        Entry::System(e) => e.envelope.uuid.as_deref(),
+        Entry::Attachment(e) => e.envelope.uuid.as_deref(),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -653,7 +670,405 @@ pub fn parse_line(line: &str) -> Option<Entry> {
     if trimmed.is_empty() {
         return None;
     }
+    // Codex rollouts wrap their records in a timestamped envelope. Parse the
+    // known record families before the Claude tagged enum's `Unknown` catch-all;
+    // a malformed/unknown Codex payload is skipped rather than becoming a
+    // misleading Claude unknown entry.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_codex_record_type)
+    {
+        return parse_codex_record(&value);
+    }
     serde_json::from_str::<Entry>(trimmed).ok()
+}
+
+/// Top-level record types currently emitted by Codex rollouts. Kept in one
+/// place so provider autodetection and the parser cannot drift apart.
+pub fn is_codex_record_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "session_meta" | "event_msg" | "response_item" | "turn_context"
+    )
+}
+
+fn codex_timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
+    value
+        .get("timestamp")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&Utc))
+}
+
+fn codex_payload(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    value.get("payload")
+}
+
+fn codex_string(value: Option<&serde_json::Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .and_then(|v| v.get(*key))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn codex_id(value: &serde_json::Value, payload: &serde_json::Value) -> Option<String> {
+    codex_string(
+        Some(payload),
+        &[
+            "id",
+            "item_id",
+            "message_id",
+            "event_id",
+            "call_id",
+            "thread_id",
+        ],
+    )
+    .or_else(|| codex_string(Some(value), &["id", "event_id"]))
+}
+
+fn codex_envelope(value: &serde_json::Value, payload: &serde_json::Value) -> Envelope {
+    Envelope {
+        uuid: codex_id(value, payload),
+        parent_uuid: Some(None),
+        timestamp: codex_timestamp(value),
+        session_id: codex_string(
+            Some(payload),
+            &["session_id", "sessionId", "thread_id", "threadId"],
+        ),
+        cwd: codex_string(Some(payload), &["cwd", "working_directory"]),
+        is_sidechain: None,
+        prompt_id: None,
+        request_id: None,
+        agent_id: None,
+        attribution_agent: None,
+        origin: None,
+    }
+}
+
+fn codex_text(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value?;
+    match value {
+        serde_json::Value::String(s) => (!s.trim().is_empty()).then(|| s.to_owned()),
+        serde_json::Value::Object(map) => {
+            codex_text(map.get("text").or_else(|| map.get("message")))
+        }
+        serde_json::Value::Array(values) => {
+            let text = values
+                .iter()
+                .filter_map(|v| codex_text(Some(v)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.trim().is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn codex_text_blocks(value: Option<&serde_json::Value>, reasoning: bool) -> Vec<ContentBlock> {
+    let mut blocks = Vec::new();
+    let Some(value) = value else { return blocks };
+    let values: Vec<&serde_json::Value> = match value {
+        serde_json::Value::Array(values) => values.iter().collect(),
+        _ => vec![value],
+    };
+    for item in values {
+        let kind = item.get("type").and_then(serde_json::Value::as_str);
+        let text = codex_text(Some(item)).or_else(|| codex_text(Some(value)));
+        let Some(text) = text.filter(|t| !t.trim().is_empty()) else {
+            continue;
+        };
+        if reasoning
+            || matches!(
+                kind,
+                Some("reasoning") | Some("summary_text") | Some("thinking")
+            )
+        {
+            blocks.push(ContentBlock::Thinking {
+                thinking: text,
+                signature: None,
+            });
+        } else {
+            blocks.push(ContentBlock::Text { text });
+        }
+    }
+    blocks
+}
+
+fn codex_usage(payload: &serde_json::Value) -> Option<Usage> {
+    let usage = payload
+        .get("usage")
+        .or_else(|| payload.get("total_token_usage"))
+        .or_else(|| payload.get("info").and_then(|v| v.get("total_token_usage")))?;
+    Some(Usage {
+        input_tokens: usage
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64),
+        output_tokens: usage
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64),
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
+    })
+}
+
+fn codex_tool_input(payload: &serde_json::Value) -> serde_json::Value {
+    let input = payload.get("arguments").or_else(|| payload.get("input"));
+    match input {
+        Some(serde_json::Value::String(s)) => {
+            serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.clone()))
+        }
+        Some(value) => value.clone(),
+        None => serde_json::Value::Object(serde_json::Map::new()),
+    }
+}
+
+fn codex_result_is_error(payload: &serde_json::Value) -> Option<bool> {
+    if let Some(error) = payload.get("is_error").and_then(serde_json::Value::as_bool) {
+        return Some(error);
+    }
+    if payload.get("error").is_some() {
+        return Some(true);
+    }
+    if payload
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .is_some_and(|code| code != 0)
+    {
+        return Some(true);
+    }
+    if payload
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| matches!(status, "failed" | "error" | "cancelled"))
+    {
+        return Some(true);
+    }
+    Some(false)
+}
+
+fn codex_tool_result(
+    value: &serde_json::Value,
+    payload: &serde_json::Value,
+    output: Option<&serde_json::Value>,
+) -> Entry {
+    let envelope = codex_envelope(value, payload);
+    let tool_use_id = codex_string(
+        Some(payload),
+        &["call_id", "callId", "command_id", "patch_id", "id"],
+    );
+    let output = output.and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Null => None,
+        other => Some(other.to_string()),
+    });
+    Entry::User(Box::new(UserEntry {
+        envelope,
+        message: Some(UserMessage {
+            role: Some("user".to_owned()),
+            content: Some(UserContent::Blocks(vec![UserContentBlock::ToolResult(
+                ToolResult {
+                    tool_use_id,
+                    content: output.map(ToolResultContent::Text),
+                    is_error: codex_result_is_error(payload),
+                },
+            )])),
+        }),
+        tool_use_result: None,
+    }))
+}
+
+fn codex_task_entry(value: &serde_json::Value, payload: &serde_json::Value, status: &str) -> Entry {
+    let envelope = codex_envelope(value, payload);
+    let id = codex_string(Some(payload), &["thread_id", "threadId", "id"])
+        .unwrap_or_else(|| "codex-task".to_owned());
+    let text = format!(
+        "<task-notification>\n<task-id>{id}</task-id>\n<status>{status}</status>\n</task-notification>"
+    );
+    Entry::User(Box::new(UserEntry {
+        envelope,
+        message: Some(UserMessage {
+            role: Some("user".to_owned()),
+            content: Some(UserContent::Text(text)),
+        }),
+        tool_use_result: None,
+    }))
+}
+
+/// Convert one known Codex envelope to one canonical Claude-shaped entry.
+///
+/// Codex records are intentionally normalized here instead of introducing a
+/// second timeline model: existing graph/timeline/tool pairing and the browser
+/// `replay_from_jsonl` API consequently keep the same semantics.
+fn parse_codex_record(value: &serde_json::Value) -> Option<Entry> {
+    let kind = value.get("type")?.as_str()?;
+    let payload = codex_payload(value)?;
+    match kind {
+        "session_meta" => Some(Entry::AiTitle(AiTitleEntry {
+            title: codex_string(Some(payload), &["agent_nickname", "model_provider"])
+                .map(|v| format!("Codex · {v}")),
+        })),
+        "turn_context" => Some(Entry::Mode(FlatValueEntry {
+            fields: payload.clone(),
+        })),
+        "response_item" => match payload.get("type").and_then(serde_json::Value::as_str)? {
+            "message" => {
+                let role = codex_string(Some(payload), &["role"])
+                    .unwrap_or_else(|| "assistant".to_owned());
+                let content = codex_text_blocks(payload.get("content"), false);
+                let envelope = codex_envelope(value, payload);
+                if role == "user" {
+                    let text = content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    Some(Entry::User(Box::new(UserEntry {
+                        envelope,
+                        message: Some(UserMessage {
+                            role: Some(role),
+                            content: Some(UserContent::Text(text)),
+                        }),
+                        tool_use_result: None,
+                    })))
+                } else {
+                    Some(Entry::Assistant(Box::new(AssistantEntry {
+                        envelope,
+                        message: Some(AssistantMessage {
+                            role: Some(role),
+                            model: codex_string(Some(payload), &["model"]),
+                            content,
+                            stop_reason: None,
+                            usage: codex_usage(payload),
+                        }),
+                    })))
+                }
+            }
+            "reasoning" => Some(Entry::Assistant(Box::new(AssistantEntry {
+                envelope: codex_envelope(value, payload),
+                message: Some(AssistantMessage {
+                    role: Some("assistant".to_owned()),
+                    model: None,
+                    content: codex_text_blocks(
+                        payload.get("summary").or_else(|| payload.get("content")),
+                        true,
+                    ),
+                    stop_reason: None,
+                    usage: None,
+                }),
+            }))),
+            "function_call" | "custom_tool_call" => {
+                let id = codex_string(Some(payload), &["call_id", "callId", "id"]);
+                let name = codex_string(Some(payload), &["name", "tool_name"]);
+                Some(Entry::Assistant(Box::new(AssistantEntry {
+                    envelope: codex_envelope(value, payload),
+                    message: Some(AssistantMessage {
+                        role: Some("assistant".to_owned()),
+                        model: None,
+                        content: vec![ContentBlock::ToolUse(ToolUse {
+                            id,
+                            name,
+                            input: codex_tool_input(payload),
+                            caller: serde_json::Value::Null,
+                        })],
+                        stop_reason: None,
+                        usage: None,
+                    }),
+                })))
+            }
+            "function_call_output" | "custom_tool_call_output" => Some(codex_tool_result(
+                value,
+                payload,
+                payload.get("output").or_else(|| payload.get("result")),
+            )),
+            _ => None,
+        },
+        "event_msg" => {
+            let event_type = payload.get("type").and_then(serde_json::Value::as_str)?;
+            match event_type {
+                "user_message" => {
+                    let text = codex_text(payload.get("message").or_else(|| payload.get("text")))?;
+                    Some(Entry::User(Box::new(UserEntry {
+                        envelope: codex_envelope(value, payload),
+                        message: Some(UserMessage {
+                            role: Some("user".to_owned()),
+                            content: Some(UserContent::Text(text)),
+                        }),
+                        tool_use_result: None,
+                    })))
+                }
+                "agent_message" => {
+                    let text = codex_text(payload.get("message").or_else(|| payload.get("text")))?;
+                    Some(Entry::Assistant(Box::new(AssistantEntry {
+                        envelope: codex_envelope(value, payload),
+                        message: Some(AssistantMessage {
+                            role: Some("assistant".to_owned()),
+                            model: None,
+                            content: vec![ContentBlock::Text { text }],
+                            stop_reason: None,
+                            usage: None,
+                        }),
+                    })))
+                }
+                "agent_reasoning" => {
+                    let text = codex_text(payload.get("text").or_else(|| payload.get("message")))?;
+                    Some(Entry::Assistant(Box::new(AssistantEntry {
+                        envelope: codex_envelope(value, payload),
+                        message: Some(AssistantMessage {
+                            role: Some("assistant".to_owned()),
+                            model: None,
+                            content: vec![ContentBlock::Thinking {
+                                thinking: text,
+                                signature: None,
+                            }],
+                            stop_reason: None,
+                            usage: None,
+                        }),
+                    })))
+                }
+                "exec_command_end" | "patch_apply_end" => Some(codex_tool_result(
+                    value,
+                    payload,
+                    payload
+                        .get("output")
+                        .or_else(|| payload.get("result"))
+                        .or_else(|| payload.get("message")),
+                )),
+                "token_count" => {
+                    let mut envelope = codex_envelope(value, payload);
+                    envelope.request_id = Some("codex-token-total".to_owned());
+                    let usage = codex_usage(payload)?;
+                    Some(Entry::Assistant(Box::new(AssistantEntry {
+                        envelope,
+                        message: Some(AssistantMessage {
+                            role: Some("assistant".to_owned()),
+                            model: None,
+                            content: Vec::new(),
+                            stop_reason: None,
+                            usage: Some(usage),
+                        }),
+                    })))
+                }
+                "task_started" => Some(codex_task_entry(value, payload, "started")),
+                "task_complete" => Some(codex_task_entry(
+                    value,
+                    payload,
+                    codex_string(Some(payload), &["status"])
+                        .as_deref()
+                        .unwrap_or("completed"),
+                )),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Parse a subagent `meta.json` sidecar. Returns `None` on read/parse failure.
@@ -749,6 +1164,198 @@ pub fn latest_session_file(project_dir: &std::path::Path) -> Option<std::path::P
         }
     }
     best.map(|(_, p)| p)
+}
+
+// ---------------------------------------------------------------------------
+// Codex rollout discovery
+// ---------------------------------------------------------------------------
+
+/// Prefix used in the legacy `Update::SubagentMeta.workflow` slot to carry a
+/// Codex `parent_thread_id` without changing the Claude-facing public struct.
+/// It is private protocol between this module and `SessionModel`; ordinary
+/// Claude workflow ids cannot collide with the control prefix.
+pub const CODEX_PARENT_PREFIX: &str = "\u{1f}codex-parent:";
+
+/// Metadata needed to link a Codex rollout to its parent thread. Authentication
+/// files are never consulted; callers only pass `rollout-*.jsonl` paths here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSessionMeta {
+    pub session_id: String,
+    pub parent_thread_id: Option<String>,
+    pub cwd: Option<String>,
+    pub model_provider: Option<String>,
+    pub agent_nickname: Option<String>,
+}
+
+/// A discovered Codex rollout and its parsed linkage metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSessionFile {
+    pub path: std::path::PathBuf,
+    pub meta: Option<CodexSessionMeta>,
+}
+
+/// `$CODEX_HOME/sessions`, falling back to `~/.codex/sessions`.
+pub fn codex_sessions_root() -> Option<std::path::PathBuf> {
+    if let Some(home) = std::env::var_os("CODEX_HOME") {
+        return Some(std::path::PathBuf::from(home).join("sessions"));
+    }
+    #[allow(deprecated)]
+    let home = std::env::home_dir()
+        .filter(|h| !h.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))?;
+    Some(home.join(".codex").join("sessions"))
+}
+
+/// Whether a path is a Codex rollout transcript. This narrow filename filter
+/// is what prevents discovery from opening `$CODEX_HOME/auth.json` or other
+/// unrelated files.
+pub fn is_codex_session_file(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.starts_with("rollout-"))
+}
+
+/// Read only the first session metadata record from a rollout file.
+pub fn codex_session_meta(path: &std::path::Path) -> Option<CodexSessionMeta> {
+    if !is_codex_session_file(path) {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    for line in text.lines().take(256) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let payload = value.get("payload")?;
+        let session_id = codex_string(
+            Some(payload),
+            &["session_id", "sessionId", "id", "thread_id", "threadId"],
+        )
+        .or_else(|| codex_string(Some(&value), &["session_id", "sessionId", "id"]))?;
+        return Some(CodexSessionMeta {
+            session_id,
+            parent_thread_id: codex_string(
+                Some(payload),
+                &["parent_thread_id", "parentThreadId", "forked_from_id"],
+            ),
+            cwd: codex_string(Some(payload), &["cwd", "working_directory"]),
+            model_provider: codex_string(Some(payload), &["model_provider", "modelProvider"]),
+            agent_nickname: codex_string(Some(payload), &["agent_nickname", "agentNickname"]),
+        });
+    }
+    None
+}
+
+/// Scan the rollout day directory containing `main_path`, returning the target
+/// rollout and its descendants. Codex writes root and subagent rollouts side by
+/// side; parent ids are followed transitively, while unrelated sessions remain
+/// hidden. The result is deterministic and never includes non-rollout files.
+pub fn scan_codex_session_files(main_path: &std::path::Path) -> Vec<CodexSessionFile> {
+    if !is_codex_session_file(main_path) {
+        return Vec::new();
+    }
+    let Some(dir) = main_path.parent() else {
+        return Vec::new();
+    };
+    let mut all = Vec::new();
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        if is_codex_session_file(&path) {
+            all.push(CodexSessionFile {
+                meta: codex_session_meta(&path),
+                path,
+            });
+        }
+    }
+    all.sort_by(|a, b| a.path.cmp(&b.path));
+    let target_id = all
+        .iter()
+        .find(|f| f.path == main_path)
+        .and_then(|f| f.meta.as_ref())
+        .map(|m| m.session_id.clone());
+    let mut included = std::collections::HashSet::new();
+    included.insert(main_path.to_path_buf());
+    if let Some(target_id) = target_id {
+        // Repeatedly add records whose parent is already included. The ids are
+        // small and day directories are bounded, so a fixed-point pass is both
+        // simple and robust to arbitrary child-before-parent file ordering.
+        let mut ids = std::collections::HashSet::from([target_id]);
+        loop {
+            let mut changed = false;
+            for file in &all {
+                let Some(meta) = &file.meta else { continue };
+                if included.contains(&file.path) {
+                    ids.insert(meta.session_id.clone());
+                    continue;
+                }
+                if meta
+                    .parent_thread_id
+                    .as_ref()
+                    .is_some_and(|parent| ids.contains(parent))
+                {
+                    included.insert(file.path.clone());
+                    ids.insert(meta.session_id.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+    let mut result: Vec<_> = all
+        .into_iter()
+        .filter(|f| included.contains(&f.path))
+        .collect();
+    result.sort_by_key(|f| if f.path == main_path { 0 } else { 1 });
+    result
+}
+
+/// Find the newest rollout recursively below `$CODEX_HOME/sessions` (date
+/// directories are `YYYY/MM/DD`). Depth is bounded to avoid traversing an
+/// arbitrary user tree if a custom `CODEX_HOME` is malformed. Archived rollout
+/// directories are intentionally ignored: they are historical storage, not an
+/// active root/subagent session to auto-follow.
+pub fn latest_codex_session_file(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    fn visit(
+        dir: &std::path::Path,
+        depth: usize,
+        best: &mut Option<(std::time::SystemTime, std::path::PathBuf)>,
+    ) {
+        if depth > 4 {
+            return;
+        }
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if is_codex_session_file(&path) {
+                let Ok(meta) = entry.metadata() else { continue };
+                let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                let replace = best.as_ref().is_none_or(|(old, old_path)| {
+                    modified > *old || (modified == *old && path > *old_path)
+                });
+                if replace {
+                    *best = Some((modified, path));
+                }
+            } else if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && entry.file_name().to_str() != Some("archived")
+            {
+                visit(&path, depth + 1, best);
+            }
+        }
+    }
+    let mut best = None;
+    visit(root, 0, &mut best);
+    best.map(|(_, path)| path)
 }
 
 // ---------------------------------------------------------------------------
@@ -855,6 +1462,110 @@ pub fn workflow_dir(subagents_dir: &std::path::Path, wf_id: &str) -> std::path::
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn codex_rollout_records_normalize_to_canonical_entries() {
+        let meta = parse_line(
+            r#"{"timestamp":"2026-08-25T01:02:03Z","type":"session_meta","payload":{"id":"root","model_provider":"openai"}}"#,
+        )
+        .expect("session_meta is recognized");
+        assert!(matches!(meta, Entry::AiTitle(_)));
+
+        let call = parse_line(
+            r#"{"timestamp":"2026-08-25T01:02:04Z","type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"exec_command","arguments":"{\"cmd\":\"rg TODO\"}"}}"#,
+        )
+        .expect("function call is recognized");
+        match call {
+            Entry::Assistant(entry) => {
+                assert_eq!(
+                    entry.envelope.timestamp.unwrap().to_rfc3339(),
+                    "2026-08-25T01:02:04+00:00"
+                );
+                assert!(
+                    matches!(entry.message.unwrap().content.first(), Some(ContentBlock::ToolUse(tool)) if tool.id.as_deref() == Some("call-1"))
+                );
+            }
+            other => panic!("expected assistant tool call, got {other:?}"),
+        }
+
+        let output = parse_line(
+            r#"{"timestamp":"2026-08-25T01:02:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"ok"}}"#,
+        )
+        .expect("function output is recognized");
+        match output {
+            Entry::User(entry) => assert!(matches!(
+                entry.message.and_then(|m| m.content),
+                Some(UserContent::Blocks(blocks))
+                    if matches!(blocks.first(), Some(UserContentBlock::ToolResult(result)) if result.is_error == Some(false))
+            )),
+            other => panic!("expected user tool result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_codex_records_are_skipped_without_becoming_unknown() {
+        assert!(parse_line(r#"{"type":"response_item","payload":null}"#).is_none());
+        assert!(
+            parse_line(r#"{"type":"response_item","payload":{"type":"future_record"}}"#).is_none()
+        );
+        assert!(parse_line("not json").is_none());
+    }
+
+    #[test]
+    fn codex_event_messages_cover_reasoning_patch_lifecycle_and_tokens() {
+        let reasoning = parse_line(
+            r#"{"timestamp":"2026-08-25T01:02:06Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"inspect first"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            reasoning,
+            Entry::Assistant(entry)
+                if entry.message.as_ref().is_some_and(|message| matches!(
+                    message.content.first(),
+                    Some(ContentBlock::Thinking { thinking, .. }) if thinking == "inspect first"
+                ))
+        ));
+
+        let patch_end = parse_line(
+            r#"{"timestamp":"2026-08-25T01:02:07Z","type":"event_msg","payload":{"type":"patch_apply_end","patch_id":"patch-1","status":"failed","output":"reject"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            patch_end,
+            Entry::User(entry)
+                if matches!(
+                    entry.message.as_ref().and_then(|m| m.content.as_ref()),
+                    Some(UserContent::Blocks(blocks))
+                        if blocks.iter().any(|block| matches!(
+                            block,
+                            UserContentBlock::ToolResult(result) if result.is_error == Some(true)
+                        ))
+                )
+        ));
+
+        let tokens = parse_line(
+            r#"{"timestamp":"2026-08-25T01:02:08Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":42}}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            tokens,
+            Entry::Assistant(entry)
+                if entry
+                    .message
+                    .as_ref()
+                    .and_then(|message| message.usage.as_ref())
+                    .and_then(|usage| usage.output_tokens)
+                    == Some(42)
+        ));
+
+        let lifecycle = parse_line(
+            r#"{"timestamp":"2026-08-25T01:02:09Z","type":"event_msg","payload":{"type":"task_complete","thread_id":"child","status":"failed"}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(lifecycle, Entry::User(entry) if entry.prompt_text().is_some_and(|text| parse_task_notification(text).is_some_and(|n| n.status == TaskStatus::Failed)))
+        );
+    }
 
     #[test]
     fn parse_task_notification_extracts_id_and_status() {
@@ -1364,6 +2075,58 @@ mod tests {
 
         let latest = latest_session_file(&tmp).expect("finds one");
         assert_eq!(latest, newer, "newest uuid .jsonl wins; sidecars ignored");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn codex_discovery_links_only_parented_rollouts_and_ignores_auth() {
+        let tmp = std::env::temp_dir().join(format!(
+            "zoetrope-codex-discovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let root = tmp.join("rollout-root.jsonl");
+        let child = tmp.join("rollout-child.jsonl");
+        let unrelated = tmp.join("rollout-other.jsonl");
+        std::fs::write(
+            &root,
+            b"{\"timestamp\":\"2026-08-25T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"root\",\"cwd\":\"/tmp\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &child,
+            b"{\"timestamp\":\"2026-08-25T00:00:01Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"parent_thread_id\":\"root\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &unrelated,
+            b"{\"timestamp\":\"2026-08-25T00:00:02Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"other\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.join("auth.json"), b"must not be opened").unwrap();
+        let archived = tmp.join("archived");
+        std::fs::create_dir_all(&archived).unwrap();
+        let archived_rollout = archived.join("rollout-archived.jsonl");
+        std::fs::write(&archived_rollout, b"not active\n").unwrap();
+
+        let found = scan_codex_session_files(&root);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].path, root);
+        assert_eq!(found[1].path, child);
+        assert!(!found.iter().any(|f| f.path == unrelated));
+        assert!(
+            codex_session_meta(&child)
+                .unwrap()
+                .parent_thread_id
+                .as_deref()
+                == Some("root")
+        );
+        assert_ne!(latest_codex_session_file(&tmp), Some(archived_rollout));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

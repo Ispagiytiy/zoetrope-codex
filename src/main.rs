@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::mpsc;
 
+use zoetrope::provider::ProviderKind;
 use zoetrope::state::session::{AgentKind, SessionModel, ToolState};
 use zoetrope::state::{App, Mode};
 use zoetrope::tailer::{Source, TailRequest, UiEvent, Update};
@@ -39,9 +40,13 @@ pub enum Cli {
         target: Option<PathBuf>,
         follow: bool,
         speed: f64,
+        provider: ProviderKind,
     },
     /// Headless: parse and print the session tree + info; no TUI.
-    Inspect { file: PathBuf },
+    Inspect {
+        file: PathBuf,
+        provider: ProviderKind,
+    },
 }
 
 /// Default replay speed multiplier.
@@ -56,6 +61,7 @@ USAGE:
     zoe <dir>               follow another project's live session
     zoe <file> --follow     follow a file's live edge instead of replaying
     zoe <file> --speed N    playback speed (default 8.0)
+    zoe --provider P         provider: auto, claude, or codex
     zoe inspect <file>      headless: print the session tree + info
     zoe --version           print the version and exit
 
@@ -65,18 +71,34 @@ Once open, scrub/follow/pause/go-live are available no matter how you launched."
 fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
     // Skip argv[0].
     let mut args = args.skip(1).peekable();
+    let env_provider = std::env::var("ZOETROPE_PROVIDER")
+        .ok()
+        .map(|value| value.parse::<ProviderKind>().map_err(|e| anyhow!(e)))
+        .transpose()?;
 
     // `inspect <file>` is the one distinct (headless) subcommand.
     if args.peek().map(String::as_str) == Some("inspect") {
         args.next();
-        let file = args
-            .next()
-            .ok_or_else(|| anyhow!("inspect requires a <file.jsonl>\n\n{USAGE}"))?;
-        if args.next().is_some() {
-            bail!("inspect takes a single file argument\n\n{USAGE}");
+        let mut provider = env_provider.unwrap_or_default();
+        let mut file: Option<PathBuf> = None;
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--provider" => {
+                    let value = args.next().ok_or_else(|| {
+                        anyhow!("--provider requires auto, claude, or codex\n\n{USAGE}")
+                    })?;
+                    provider = value.parse().map_err(|e: String| anyhow!(e))?;
+                }
+                other if other.starts_with('-') => {
+                    bail!("unknown flag {other:?}\n\n{USAGE}");
+                }
+                _ if file.is_none() => file = Some(PathBuf::from(arg)),
+                _ => bail!("inspect takes a single file argument\n\n{USAGE}"),
+            }
         }
         return Ok(Cli::Inspect {
-            file: PathBuf::from(file),
+            file: file.ok_or_else(|| anyhow!("inspect requires a <file.jsonl>\n\n{USAGE}"))?,
+            provider,
         });
     }
 
@@ -84,6 +106,7 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
     let mut target: Option<PathBuf> = None;
     let mut follow = false;
     let mut speed = DEFAULT_REPLAY_SPEED;
+    let mut provider = env_provider.unwrap_or_default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -97,6 +120,12 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
                 std::process::exit(0);
             }
             "--follow" => follow = true,
+            "--provider" => {
+                let value = args.next().ok_or_else(|| {
+                    anyhow!("--provider requires auto, claude, or codex\n\n{USAGE}")
+                })?;
+                provider = value.parse().map_err(|e: String| anyhow!(e))?;
+            }
             "--speed" => {
                 let v = args
                     .next()
@@ -124,6 +153,7 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
         target,
         follow,
         speed,
+        provider,
     })
 }
 
@@ -160,6 +190,13 @@ fn fold_meta(model: &mut SessionModel, path: &Path, agent_id: &str, workflow: Op
 /// the main transcript. Shared by `inspect`; the live/replay path uses the
 /// tailer instead.
 fn parse_session_fully(main_file: &Path) -> Result<SessionModel> {
+    parse_session_fully_with_provider(main_file, ProviderKind::Auto)
+}
+
+fn parse_session_fully_with_provider(
+    main_file: &Path,
+    provider: ProviderKind,
+) -> Result<SessionModel> {
     let session_id = main_file
         .file_stem()
         .and_then(|s| s.to_str())
@@ -168,12 +205,40 @@ fn parse_session_fully(main_file: &Path) -> Result<SessionModel> {
 
     let mut model = SessionModel::new(session_id.clone());
 
+    let is_codex = provider == ProviderKind::Codex
+        || (provider == ProviderKind::Auto && transcript::is_codex_session_file(main_file));
+
+    if is_codex {
+        let root_id = transcript::codex_session_meta(main_file).map(|meta| meta.session_id);
+        for file in transcript::scan_codex_session_files(main_file) {
+            if file.path == main_file {
+                continue;
+            }
+            let Some(meta) = file.meta else { continue };
+            let parent = meta
+                .parent_thread_id
+                .as_deref()
+                .filter(|parent| root_id.as_deref() != Some(*parent))
+                .map(|parent| format!("{}{}", transcript::CODEX_PARENT_PREFIX, parent));
+            let description = meta
+                .agent_nickname
+                .clone()
+                .or_else(|| meta.model_provider.clone());
+            let virtual_meta = transcript::SubagentMeta {
+                agent_type: Some("codex".to_owned()),
+                description,
+                tool_use_id: None,
+                stopped_by_user: None,
+            };
+            model.apply_meta(&meta.session_id, parent.as_deref(), &virtual_meta);
+            let _ = fold_file(&mut model, &file.path, Source::Sub(meta.session_id));
+        }
     // Subagent sidecars live in `<main_file dir>/<session-uuid>/subagents/`.
     // Parse subagent metas + transcripts first so agents exist before the main
     // transcript's tool_results resolve their statuses. Order is not critical —
     // the model is fold-order independent for completion — but this keeps the
     // tree well-formed.
-    if let Some(subs) = transcript::subagents_dir(main_file) {
+    } else if let Some(subs) = transcript::subagents_dir(main_file) {
         // Direct subagents: agent-<id>.jsonl + agent-<id>.meta.json
         collect_subagents(&mut model, &subs, None);
 
@@ -220,11 +285,25 @@ fn collect_subagents(model: &mut SessionModel, dir: &Path, workflow: Option<&str
 /// Run the `inspect` subcommand: fully parse the session and print a tree to
 /// stdout. Returns an error (non-zero exit) on an unreadable file. This is the
 /// headless smoke test — no TTY required.
-async fn run_inspect(file: PathBuf) -> Result<()> {
+async fn run_inspect(file: PathBuf, provider: ProviderKind) -> Result<()> {
     if !file.is_file() {
         bail!("not a readable file: {}", file.display());
     }
-    let model = parse_session_fully(&file)?;
+    let detected = detect_provider_file(&file);
+    if provider != ProviderKind::Auto && detected.is_some_and(|found| found != provider) {
+        bail!(
+            "provider mismatch for {}: requested {}, detected {}",
+            file.display(),
+            provider,
+            detected.unwrap()
+        );
+    }
+    let effective_provider = if provider == ProviderKind::Auto {
+        detect_provider_file(&file).unwrap_or(ProviderKind::Claude)
+    } else {
+        provider
+    };
+    let model = parse_session_fully_with_provider(&file, effective_provider)?;
     let info = read_session_info(&file);
 
     let title = info.title.as_deref().unwrap_or("(untitled)");
@@ -337,6 +416,17 @@ fn print_agent_tree(model: &SessionModel, parent: Option<&str>, depth: usize) {
     }
 }
 
+/// Detect an explicit transcript without requiring a provider-specific path.
+/// A malformed/empty file remains Claude-compatible: the existing parser will
+/// safely skip it and the caller can still inspect the resulting empty model.
+fn detect_provider_file(path: &Path) -> Option<ProviderKind> {
+    std::fs::read_to_string(path).ok().and_then(|text| {
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .find_map(ProviderKind::detect_line)
+    })
+}
+
 /// Resolve a `View` invocation into (session id, watch target, mode, feeder,
 /// speed), then spawn the tailer and run the TUI.
 ///
@@ -348,12 +438,13 @@ async fn run_tui(cli: Cli) -> Result<()> {
         target,
         follow,
         speed,
+        provider,
     } = cli
     else {
         unreachable!("inspect handled in main");
     };
 
-    let (session_id, watch_target, mode, replay, speed) = match target {
+    let (session_id, watch_target, mode, replay, speed, provider) = match target {
         // A concrete file → bulk-load + tail. Paced from the start unless
         // `--follow` asks to ride the (possibly still-growing) edge.
         Some(file) if file.is_file() => {
@@ -363,7 +454,21 @@ async fn run_tui(cli: Cli) -> Result<()> {
                 .unwrap_or("session")
                 .to_string();
             let mode = if follow { Mode::Live } else { Mode::Replay };
-            (session_id, file, mode, true, speed)
+            let detected = detect_provider_file(&file);
+            if provider != ProviderKind::Auto && detected.is_some_and(|found| found != provider) {
+                bail!(
+                    "provider mismatch for {}: requested {}, detected {}",
+                    file.display(),
+                    provider,
+                    detected.unwrap()
+                );
+            }
+            let provider = if provider == ProviderKind::Auto {
+                detected.unwrap_or(ProviderKind::Claude)
+            } else {
+                provider
+            };
+            (session_id, file, mode, true, speed, provider)
         }
         // A directory (or none → cwd) → live: discover the latest session and
         // follow it. (The dir need not exist yet; the tailer waits.)
@@ -373,21 +478,81 @@ async fn run_tui(cli: Cli) -> Result<()> {
             {
                 bail!("not found: {}", p.display());
             }
+            let explicit_dir = other.clone();
             let cwd = match other {
                 Some(d) => d,
                 None => std::env::current_dir().context("resolving current directory")?,
             };
-            let proj = transcript::project_dir(&cwd)
-                .ok_or_else(|| anyhow!("no Claude projects directory for {}", cwd.display()))?;
+            let proj = transcript::project_dir(&cwd);
+            let (watch_dir, provider) = match provider {
+                ProviderKind::Codex => (
+                    explicit_dir
+                        .or_else(transcript::codex_sessions_root)
+                        .ok_or_else(|| anyhow!("no Codex sessions directory"))?,
+                    ProviderKind::Codex,
+                ),
+                ProviderKind::Auto
+                    if explicit_dir.is_some()
+                        && explicit_dir
+                            .as_deref()
+                            .and_then(transcript::latest_codex_session_file)
+                            .is_some()
+                        && proj
+                            .as_deref()
+                            .and_then(transcript::latest_session_file)
+                            .is_none() =>
+                {
+                    (explicit_dir.expect("checked above"), ProviderKind::Codex)
+                }
+                ProviderKind::Auto
+                    if explicit_dir.is_none()
+                        && proj
+                            .as_deref()
+                            .and_then(transcript::latest_session_file)
+                            .is_none()
+                        && transcript::codex_sessions_root()
+                            .as_deref()
+                            .and_then(transcript::latest_codex_session_file)
+                            .is_some() =>
+                {
+                    (
+                        transcript::codex_sessions_root().expect("checked above"),
+                        ProviderKind::Codex,
+                    )
+                }
+                ProviderKind::Claude => (
+                    proj.ok_or_else(|| {
+                        anyhow!("no Claude projects directory for {}", cwd.display())
+                    })?,
+                    ProviderKind::Claude,
+                ),
+                ProviderKind::Auto => (
+                    proj.ok_or_else(|| {
+                        anyhow!("no Claude projects directory for {}", cwd.display())
+                    })?,
+                    ProviderKind::Auto,
+                ),
+            };
             // Best-effort latest session id so stale events filter; the tailer
             // re-discovers and may switch.
-            let session_id = transcript::latest_session_file(&proj)
-                .as_deref()
-                .and_then(Path::file_stem)
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            (session_id, proj, Mode::Live, false, DEFAULT_REPLAY_SPEED)
+            let session_id = if provider == ProviderKind::Codex {
+                transcript::latest_codex_session_file(&watch_dir)
+            } else {
+                transcript::latest_session_file(&watch_dir)
+            }
+            .as_deref()
+            .and_then(Path::file_stem)
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+            (
+                session_id,
+                watch_dir,
+                Mode::Live,
+                false,
+                DEFAULT_REPLAY_SPEED,
+                provider,
+            )
         }
     };
 
@@ -397,7 +562,10 @@ async fn run_tui(cli: Cli) -> Result<()> {
 
     // Kick off the watch before the tailer task starts consuming.
     tail_tx
-        .send(TailRequest::Watch(watch_target))
+        .send(TailRequest::WatchWithProvider {
+            path: watch_target,
+            provider,
+        })
         .await
         .map_err(|_| anyhow!("tailer channel closed before start"))?;
 
@@ -425,7 +593,7 @@ async fn main() -> Result<()> {
 
     let cli = parse_cli(std::env::args())?;
     match cli {
-        Cli::Inspect { file } => run_inspect(file).await,
+        Cli::Inspect { file, provider } => run_inspect(file, provider).await,
         other => run_tui(other).await,
     }
 }
@@ -489,6 +657,7 @@ mod tests {
                 target: Some(p),
                 follow,
                 speed,
+                ..
             } => {
                 assert_eq!(p, PathBuf::from("s.jsonl"));
                 assert_eq!(speed, 4.0);
@@ -519,6 +688,19 @@ mod tests {
     }
 
     #[test]
+    fn provider_flag_and_environment_shape_are_accepted() {
+        match cli(&["--provider", "codex", "session.jsonl"]).unwrap() {
+            Cli::View { provider, .. } => assert_eq!(provider, ProviderKind::Codex),
+            other => panic!("got {other:?}"),
+        }
+        match cli(&["inspect", "session.jsonl", "--provider", "claude"]).unwrap() {
+            Cli::Inspect { provider, .. } => assert_eq!(provider, ProviderKind::Claude),
+            other => panic!("got {other:?}"),
+        }
+        assert!(cli(&["--provider", "invalid"]).is_err());
+    }
+
+    #[test]
     fn rejects_extra_positional_and_unknown_flags() {
         assert!(cli(&["a.jsonl", "b.jsonl"]).is_err());
         assert!(cli(&["--bogus"]).is_err());
@@ -527,7 +709,14 @@ mod tests {
     #[test]
     fn inspect_takes_one_file() {
         match cli(&["inspect", "s.jsonl"]).unwrap() {
-            Cli::Inspect { file } => assert_eq!(file, PathBuf::from("s.jsonl")),
+            Cli::Inspect { file, .. } => assert_eq!(file, PathBuf::from("s.jsonl")),
+            other => panic!("got {other:?}"),
+        }
+        match cli(&["inspect", "--provider", "codex", "s.jsonl"]).unwrap() {
+            Cli::Inspect { file, provider } => {
+                assert_eq!(file, PathBuf::from("s.jsonl"));
+                assert_eq!(provider, ProviderKind::Codex);
+            }
             other => panic!("got {other:?}"),
         }
         assert!(cli(&["inspect"]).is_err());
