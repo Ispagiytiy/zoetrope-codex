@@ -151,7 +151,22 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: crate-ci/committed@master
-        with:
-          args: "-vv"
-          commits: ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+      - name: Install committed
+        env:
+          COMMITTED_VERSION: 1.1.11
+        run: |
+          archive="$RUNNER_TEMP/committed.tar.gz"
+          curl --fail --location --silent --show-error \
+            "https://github.com/crate-ci/committed/releases/download/v${COMMITTED_VERSION}/committed-v${COMMITTED_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            --output "$archive"
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Lint non-merge commits
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mapfile -t commits < <(git rev-list --reverse --no-merges "$BASE_SHA..$HEAD_SHA")
+          for commit in "${commits[@]}"; do
+            committed --color=always -vv "$commit"
+          done
