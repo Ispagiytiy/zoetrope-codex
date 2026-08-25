@@ -384,7 +384,7 @@ fn render_scrubber(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         // Event markers, PAST only (reveal as the playhead reaches them — in sync
         // with the graph's chips): spawns, then failures (more urgent → on top).
-        // Spawn = the Claude sunburst in Claude coral (#d7875f ≈ xterm 173).
+        // Spawn = the provider-neutral sunburst in coral (#d7875f ≈ xterm 173).
         for c in (0..head).filter(|&c| spawn_at[c]) {
             buf[(x(c), marker_y)]
                 .set_symbol("❋")

@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: website-${{ github.head_ref || github.run_id }}
+  group: website-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -78,14 +78,14 @@ jobs:
           path: web/dist
           retention-days: 1
 
-  # Split from the build so that `environment:` only ever applies to a real
-  # deploy. `environment:` cannot be conditional, so leaving it on a job that
-  # also runs for pull requests would file every PR build as a production
-  # deployment. This job is what puts the live URL in the repo's sidebar.
+  # Builds run for every event; production deploys run only from main.
   deploy:
     name: Deploy
     needs: build
-    if: github.event_name != 'pull_request'
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/main' &&
+      (github.repository == 'furkankly/zoetrope' || vars.ENABLE_VERCEL_DEPLOY == 'true')
     runs-on: ubuntu-latest
     environment:
       name: production

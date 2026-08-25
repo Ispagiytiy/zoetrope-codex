@@ -7,11 +7,35 @@ reasoning that governs how those pieces are allowed to behave.
 
 The whole program solves one hard problem:
 
-> Reconstruct a faithful, navigable, live-or-replayed picture of a Claude Code
-> agent session from an **undocumented, append-only, partially-timestamped,
-> multi-file** transcript — in which **completion is frequently unknowable**.
+> Reconstruct a faithful, navigable, live-or-replayed picture of a Claude Code or
+> Codex agent session from an **undocumented, append-only, partially-timestamped,
+> provider-specific** transcript — in which **completion is frequently unknowable**.
 
 Almost every design decision below is downstream of that one sentence.
+
+### 0.1 Provider boundary
+
+Claude Code and Codex are separate local log producers. The provider adapter owns
+their directory discovery, record decoding, timestamp extraction, and provider-specific
+completion signals; the shared timeline and `SessionModel` consume normalized facts.
+Provider choice is explicit (`claude` or `codex`) or a best-effort `auto` detection of
+known layouts/record markers. A concrete file is pinned to that file and is never
+merged with neighboring sessions. Native directory discovery keeps Claude precedence
+under `auto` for backwards compatibility when both provider stores are available;
+explicit selection overrides it. The browser picker has a stricter contract and must
+reject mixed Claude/Codex selections instead of silently choosing one.
+
+The default roots are provider-specific: Claude Code uses
+`~/.claude/projects/<sanitized-cwd>/`; Codex CLI uses
+`$CODEX_HOME/sessions/YYYY/MM/DD/`, with `$CODEX_HOME` defaulting to `~/.codex`.
+`CODEX_HOME` is an input to discovery only; it never changes the normalized model or
+the read-only guarantee.
+
+Both frontends are read-only and require no Claude/Codex credentials. Native/core code
+has no HTTP client. The hosted browser page may request its own static assets, fonts,
+or analytics, but selected transcript bytes are parsed in-browser and are not uploaded
+by zoetrope. Transcript JSONL may contain prompts, paths, tool payloads, source snippets,
+and model metadata; treat it as sensitive and use only redacted fixtures.
 
 ---
 
@@ -30,9 +54,11 @@ list), not a join store.
 
 Why this is non-negotiable — three independent consumers demand it:
 
-- **Multi-file merge.** Main transcript, `subagents/*.jsonl`, and workflow
-  `journal.jsonl` are tailed separately and interleave by timestamp; a subagent's
-  result can be read before its spawn.
+- **Provider-source merge.** A provider may expose a main rollout plus sidecar
+  transcripts or lifecycle ledgers. Each source is tailed separately and interleaved
+  by timestamp; a result can be read before the spawn it refers to. The Claude
+  `subagents/*.jsonl` + workflow `journal.jsonl` layout is one adapter, not a global
+  assumption.
 - **Backward seek.** Folding is forward-only, so seeking into the past *rebuilds*
   the model from `items[0..target]` from scratch. That rebuild must land on
   exactly the state that playing there would have.
@@ -90,10 +116,13 @@ Because completion is often unknowable, the model constantly fills gaps with
 
 Violating the second half is exactly the class of bug this session hunted down.
 
-### 2.1 The async-agent completion model
+### 2.1 Provider-specific completion signals
 
 The most dangerous piece of "ground truth" is the one that *looks* like a
-completion but isn't:
+completion but is only an acknowledgement. The raw event names differ by provider;
+the adapter must normalize only authoritative terminal facts into the common model.
+
+For the Claude provider, the signals are:
 
 - The **`Agent` tool result is a spawn acknowledgment** — literally
   `"Async agent launched successfully"` — **NOT** a completion. The subagent then
@@ -111,6 +140,11 @@ an agent against time-derived revival):
 - A **`<task-notification>`** — the timestamped terminal report for a background
   agent (`stopped` / `completed` / `failed`). Routed off the prompt spine into
   `apply_task_notification`.
+
+For the Codex provider, the adapter maps its recorded lifecycle/completion events
+into the same `terminal` fact. It must not reuse Claude's `Agent`/`Workflow` or
+`journal.jsonl` assumptions when those records are absent; unknown or merely
+informational events remain non-terminal.
 
 `meta.stoppedByUser` is a *static final* flag and is **not** used as a completion
 time — see §1.2.
