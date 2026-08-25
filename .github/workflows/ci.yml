@@ -166,7 +166,6 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          mapfile -t commits < <(git rev-list --reverse --no-merges "$BASE_SHA..$HEAD_SHA")
-          for commit in "${commits[@]}"; do
+          while IFS= read -r commit; do
             committed --color=always -vv "$commit"
-          done
+          done < <(git rev-list --reverse --no-merges "$BASE_SHA..$HEAD_SHA")
