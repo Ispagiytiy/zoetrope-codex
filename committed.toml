@@ -2,10 +2,8 @@
 
 # https://www.conventionalcommits.org
 style = "conventional"
-# allow merge commits, including their conventional `merge:` type
+# allow merge commits
 merge_commit = true
-# keep the default conventional types and explicitly allow stacked merges
-allowed_types = ["fix", "feat", "chore", "docs", "style", "refactor", "perf", "test", "merge"]
 # subject is not required to be capitalized
 subject_capitalized = false
 # subject should start with an imperative verb
