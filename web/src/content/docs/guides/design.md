@@ -5,13 +5,25 @@ description: "How zoetrope stays correct: an event-sourced projection, two clock
 
 zoetrope has one hard job, and most of its design follows from it:
 
-> Reconstruct a faithful, navigable, live-or-replayed view of a Claude Code
-> session from a transcript that is **undocumented, append-only, only partly
-> timestamped, and split across files**, and in which **you often can't tell when
+> Reconstruct a faithful, navigable, live-or-replayed view of a Claude Code or
+> Codex session from a transcript that is **undocumented, append-only, only partly
+> timestamped, provider-specific**, and in which **you often can't tell when
 > something finished.**
 
 The shape of the answer is **event sourcing**: treat the transcript as an
 append-only event log, and derive everything else from it.
+
+Claude Code and Codex use different local transcript roots and record shapes. The
+provider adapter owns discovery, decoding, timestamps, and terminal signals; the
+shared timeline and graph consume normalized facts. Native runs are read-only and
+need no provider credentials. In the browser, the user chooses the folder/files and
+the selected log bytes stay in the page; the hosted page may still load its own
+assets, fonts, or analytics.
+
+The provider can be selected explicitly (`claude` or `codex`) or detected with
+`auto`. Claude Code normally uses `~/.claude/projects/<sanitized-cwd>/`; Codex CLI
+normally uses `$CODEX_HOME/sessions/YYYY/MM/DD/`, with `$CODEX_HOME` defaulting to
+`~/.codex`. A concrete file is pinned and never merged with neighboring sessions.
 
 ## The model is a projection
 
@@ -22,9 +34,10 @@ an event is a no-op) and **commutative** (two events reach the same state in eit
 order), so the fold is **order-independent**: any arrival order converges on the
 same projection. Three things depend on that:
 
-- **Multi-file merge.** The main transcript, the subagent files, and the workflow
-  journals are separate append-only logs that interleave by timestamp. A subagent's
-  result can be folded before its spawn.
+- **Provider-source merge.** A provider may expose a main rollout, sidecars, or
+  lifecycle ledgers as separate append-only logs that interleave by timestamp. A
+  result can be folded before the spawn it refers to; the adapter's joins make the
+  final projection independent of arrival order.
 - **Time-travel.** Seeking into the past rebuilds the projection from a prefix of
   the log (`events[0..cursor]`), so it has to land on exactly the state that playing
   there would have produced. This is time-travel debugging for a session.
@@ -114,12 +127,14 @@ sit on top of it, one per crate.
   depends on the core with default features off and adds a
   [ratzilla](https://github.com/ratatui/ratzilla) WebGL2 backend plus a small
   event-conversion layer. The browser has no filesystem, so bytes are handed
-  straight to the same engine, whether from the bundled demo, an uploaded
-  transcript, or a folder opened through the File System Access API. It is deployed
+  straight to the same engine, whether from the bundled demo, a transcript supplied
+  through a file input, or a folder opened through the File System Access API. It is deployed
   as this site's [`/app`](/app) route, never installed.
 
-All IO is local. The input is your filesystem, or in the browser the bytes you hand
-it, and there is no HTTP client anywhere in the dependency tree.
+The native/core input is local filesystem data and has no HTTP client. In the browser,
+the bytes are the files you hand it and are parsed locally, but the hosted page still
+has normal asset/font/analytics traffic. That page traffic does not include the
+selected transcript bytes.
 
 ---
 
@@ -128,3 +143,16 @@ rough edges) is in
 [`docs/ARCHITECTURE.md`](https://github.com/furkankly/zoetrope/blob/main/docs/ARCHITECTURE.md).
 The module map, transcript format, and type shapes are in
 [`docs/DESIGN.md`](https://github.com/furkankly/zoetrope/blob/main/docs/DESIGN.md).
+
+## Provider QA contract
+
+- Keep the existing Claude fixtures and discovery behavior intact.
+- Use synthesized or redacted Codex rollout fixtures; never commit raw prompts,
+  paths, tool payloads, credentials, or session logs.
+- Test explicit `claude`/`codex` selection and `auto` detection for both files and
+  directories, including a `CODEX_HOME` override and ambiguous directories.
+- Verify that unknown or malformed records are skipped, live and replay converge,
+  and a selected file is never merged with neighboring sessions.
+- Browser QA must confirm that the user-selected folder is the only local input and
+  the selected log bytes are not uploaded. The page's separate asset/font/analytics
+  requests are expected and must not be described as transcript uploads.

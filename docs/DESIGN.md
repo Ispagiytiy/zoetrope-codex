@@ -1,13 +1,13 @@
 # zoetrope — Design Document (v1)
 
-**zoetrope** is a terminal UI that visualizes Claude Code agent sessions as a live flow graph: the main agent, its subagents, workflows, and tool activity — rendered with [rataflow](../../rataflow). Synthesized from a multi-agent research pass over rwy (`/Users/furkan/personal/projects/rwy`), rataflow (`/Users/furkan/personal/projects/rataflow`), and real transcripts under `~/.claude/projects/`. Full research: see the workflow output referenced in the repo history.
+**zoetrope** is a terminal UI that visualizes Claude Code or Codex agent sessions as a live flow graph: the main agent, its subagents, workflows, and tool activity — rendered with [rataflow](../../rataflow). The common model is fed by provider-specific local JSONL adapters; Claude fixtures and provider contracts remain part of the design.
 
 > **This is the v1 structural spec** (module map, transcript format, type shapes). For the *invariants and principles* the implementation now follows — order-independence, the content-vs-presentation clocks, ground-truth-over-heuristics, and the derived-state heuristics catalogue — see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Hard constraints
 
-1. **No network IO, ever.** All IO is local filesystem. No reqwest/hyper/etc. in the dep tree (dev-deps included). "Your transcripts never leave your machine" goes in the README.
-2. **Defensive parsing.** The transcript format is undocumented/internal. Unknown entry types, missing fields, malformed lines: skip, never panic. Mirrors Claude Code's own resilience.
+1. **Local, read-only transcript IO.** The native app reads only the selected local files and has no HTTP client. It does not authenticate with Claude Code or Codex. The hosted browser page may fetch its own assets and analytics, but selected log bytes are parsed in-browser and are not uploaded by zoetrope.
+2. **Defensive, provider-aware parsing.** Claude Code and Codex transcript formats are undocumented and evolving. Unknown entry types, missing fields, malformed lines, and provider-specific records that are not yet understood: skip, never panic.
 3. **rwy's async architecture**, ported: single-task UI loop owns all state; background tokio tasks feed typed messages over bounded mpsc; no `Arc<Mutex>`.
 4. rataflow is a **path dep** (`../rataflow`). Its error type is `rataflow::Error` (NOT `FlowError` — that name doesn't exist).
 
@@ -22,9 +22,26 @@ zoe <dir>                # follow another project's live session
 zoe <file> --follow      # ride a file's live edge instead of replaying it
 zoe <file> --speed 8     # playback speed (default 8.0)
 zoe inspect <file.jsonl> # no TUI: print session info + parsed tree (smoke-test)
+zoe --provider claude    # choose Claude Code's local session store
+zoe --provider codex     # choose Codex CLI's local session store
+zoe --provider auto      # detect a known provider layout or record shape
+zoe --provider codex <dir>
+zoe --provider auto <file.jsonl>
+zoe inspect --provider codex <file.jsonl>
 ```
 
-Resolution: a **file** target bulk-loads + tails (replay feeder); a **dir** (or none → cwd) discovers the latest session and live-tails. `--follow` only changes the start position (head vs beginning) via `Mode`. `Cli = View { target: Option<PathBuf>, follow: bool, speed: f64 } | Inspect { file }`. Arg parsing: hand-rolled over `std::env::args` (no clap; keep deps lean).
+Resolution: a **file** target bulk-loads + tails (replay feeder); a **dir** (or none → cwd/provider store) discovers the latest session and live-tails. `--follow` only changes the start position (head vs beginning) via `Mode`. `--provider` accepts `claude`, `codex`, or `auto`; explicit provider selection wins over discovery, while `auto` uses known directory layouts and record markers. A concrete file is always pinned to that file and never mixed with neighboring provider files. `Cli = View { provider, target: Option<PathBuf>, follow: bool, speed: f64 } | Inspect { provider, file }`. Arg parsing remains hand-rolled over `std::env::args` (no clap; keep deps lean).
+
+Provider roots are local and overridable: Claude Code uses `~/.claude/projects/<sanitized-cwd>/`; Codex CLI uses `$CODEX_HOME/sessions/YYYY/MM/DD/`, with `$CODEX_HOME` defaulting to `~/.codex`. `auto` can identify a selected file or directory from its record shape/layout; when a directory contains ambiguous candidates, pass an explicit provider.
+
+### Provider boundary
+
+Each provider adapter translates its raw records into the common timeline and
+session facts before the graph model sees them. The model must not infer a provider
+from a tool name alone, and a single session load must not merge unrelated Claude and
+Codex files. `auto` is a discovery aid, not a third transcript format: it recognizes
+known roots/layouts and record markers, then delegates to the matching adapter. An
+explicit provider is the escape hatch for a custom export or an ambiguous directory.
 
 ## Workspace layout
 
@@ -78,7 +95,7 @@ critical-section = { features = ["std"] }                  # ratatui's layout-ca
 getrandom (0.3) + getrandom_v04 (0.4)                      # both, wasm_js backend (pulled via ratzilla)
 ```
 
-**One binary per crate:** `zoe` → `src/main.rs` (`required-features = ["native"]`), the only thing `cargo install zoetrope` puts on your PATH; `web` → `web/wasm/src/main.rs`, built by trunk (`web/scripts/build-wasm.sh`) into `web.js` / `web_bg.wasm`. No network deps anywhere (hard constraint #1).
+**One binary per crate:** `zoe` → `src/main.rs` (`required-features = ["native"]`), the only thing `cargo install zoetrope` puts on your PATH; `web` → `web/wasm/src/main.rs`, built by trunk (`web/scripts/build-wasm.sh`) into `web.js` / `web_bg.wasm`. The native/core dependency tree has no HTTP client; the hosted site is a separate deployment boundary with its own assets and analytics.
 
 ## Module map
 
@@ -89,7 +106,7 @@ src/
 ├── tui.rs         # terminal lifecycle + the central native event loop (tick_camera/tick_timeline/status_tick/draw)
 ├── handler.rs     # input routing: app-level keys → App, the rest → the flow; scrubber clicks; process_flow_events
 ├── autopilot.rs   # native-only: the scripted pointer/keystroke pilot behind ZOETROPE_DEMO=1 (see DEMO-ASSETS.md)
-├── transcript.rs  # serde model for JSONL entries + meta.json sidecars + project-dir discovery/sanitization
+├── transcript.rs  # provider-aware serde model + JSONL adapters + local session discovery
 ├── state/
 │   ├── mod.rs     # App: owns the Flow + SessionModel + Timeline + SessionInfo + UI state; handle_ui_event, seek, camera
 │   ├── session.rs # SessionModel: the pure domain model (agents, statuses, tool calls) derived from parsed updates
@@ -110,7 +127,14 @@ src/
     └── panel.rs   # detail panel for the selected agent
 ```
 
-## Transcript format (verified against real data, Claude Code 2.1.153–2.1.165)
+## Transcript formats and provider adapters
+
+The parser boundary is provider-aware, but the graph/timeline model is shared. The
+formats are local JSONL and may contain sensitive prompts, paths, tool inputs/outputs,
+source snippets, and model metadata. They are undocumented and evolving; fixtures must
+be sanitized, and unknown records must remain non-fatal.
+
+### Claude Code (verified against real data, 2.1.153–2.1.165)
 
 ### Layout
 - Main: `~/.claude/projects/<sanitized-cwd>/<session-uuid>.jsonl`. Sanitization: absolute cwd, every `/` → `-` (leading slash → leading dash). Only `<uuid>.jsonl` directly in that dir are transcripts.
@@ -135,6 +159,23 @@ src/
 
 ### Tool calls
 `tool_use` names observed: Bash, Edit, Read, Write, ToolSearch, AskUserQuestion, Agent, Workflow, TaskStop, WebFetch. `Agent` input: `{description, prompt, subagent_type}`. Pair `tool_use.id` with the later user `tool_result.tool_use_id` → pending (no result yet = in-flight) vs complete (`is_error` decides Failed).
+
+### Codex CLI
+
+Codex CLI rollouts are stored as `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`
+(`$CODEX_HOME` defaults to `~/.codex`). A rollout can contain session metadata,
+turn context, user/assistant messages, reasoning, tool calls/results, and lifecycle
+events. The Codex adapter maps the records that carry session time, agent text,
+tool activity, and terminal signals into the same timeline facts as Claude; records
+that have no visual meaning remain parser noise. The exact record set is expected to
+evolve, so the adapter must default optional fields, tolerate unknown kinds, and skip
+malformed lines without aborting a session.
+
+Codex does not use Claude's UUID project-directory or `subagents/**` assumptions.
+Provider-specific discovery is therefore kept outside the common model: explicit
+`--provider codex` selects the Codex root, while `--provider auto` recognizes the
+rollout layout or record markers. A selected file is pinned and never merged with a
+neighboring session merely because it shares a parent directory.
 
 ## Domain model (state/session.rs)
 
@@ -296,13 +337,29 @@ The crossterm input channel is **unbounded** (input must never block); the **cap
 
 ## inspect subcommand
 
-`zoe inspect <file.jsonl>`: parse the session fully (transcript + subagents + journal) and print: session title, **session info** (mode · permission · queued · file edits · last prompt, via `read_session_info`), agent/tool totals, then the agent tree (type, description, status, #tools, tokens). Exit non-zero on unreadable file. **This is the headless smoke test** — CI-runnable end-to-end check of parser + session model + info extraction with no TTY.
+`zoe inspect <file.jsonl>` (optionally with `--provider claude|codex|auto`): parse the selected provider session fully and print: session title, **session info** (mode · permission · queued · file edits · last prompt, via `read_session_info`), agent/tool totals, then the agent tree (type, description, status, #tools, tokens). Exit non-zero on unreadable file. **This is the headless smoke test** — CI-runnable end-to-end check of parser + session model + info extraction with no TTY.
 
-## Testing (inline #[cfg(test)], no tests/ dir)
+## Testing and provider QA contract
 
-Worth testing: transcript line parsing against real-format fixture strings (every entry type incl. flat metadata, polymorphic content, missing is_error, Unknown), sanitization rule, partial-line buffering + truncation reset (tailer state machine over an in-memory/tempfile sequence), session model status transitions (spawn → running → done/failed; the async layer — spawn-ack supersession, `<task-notification>` terminal report, `end_of_stream`; workflow journal completion; pending-tool liveness), graph sync idempotency (same update twice = no duplicate nodes; selection preserved), and the chip reconcile behaviors (aggregation, afterglow, pending reconstruction). Not worth testing: render output, getters.
+Worth testing: transcript line parsing against real-format fixture strings (every entry type incl. flat metadata, polymorphic content, missing is_error, Unknown), provider selection and detection, provider-specific discovery, sanitization rule, partial-line buffering + truncation reset (tailer state machine over an in-memory/tempfile sequence), session model status transitions (spawn → running → done/failed; the async layer — spawn-ack supersession, `<task-notification>` terminal report, `end_of_stream`; workflow journal completion; pending-tool liveness), graph sync idempotency (same update twice = no duplicate nodes; selection preserved), and the chip reconcile behaviors (aggregation, afterglow, pending reconstruction). Not worth testing: render output, getters.
 
-**Order-independence is guarded by property tests** (the load-bearing invariant — ARCHITECTURE.md §1.1): `live_delivery_converges_to_bulk_ordering` (timeline.rs — 400 random per-file interleavings land the same ts sequence as the bulk sort, nothing left undated) and the model shuffle-invariance test (session.rs — final model state is a pure function of the fact set). ~164 tests, all inline; no `tests/` dir.
+**Provider checklist:**
+
+- [ ] Existing Claude fixture/session tests still pass unchanged.
+- [ ] Codex fixtures are synthesized or redacted; no real prompts, paths, tool
+  payloads, credentials, or raw rollout logs are committed.
+- [ ] `--provider claude`, `--provider codex`, and `--provider auto` cover both
+  explicit file targets and directory discovery, including `CODEX_HOME` overrides.
+- [ ] `auto` and an explicit provider produce the same model for an unambiguous file;
+  ambiguous or mixed directories never silently merge sessions.
+- [ ] Unknown/malformed provider records are skipped without aborting the session;
+  timestamps, tool status, and terminal state still converge in live and replay paths.
+- [ ] Browser tests/QA verify that the user-selected folder is the only input and
+  selected log bytes are not uploaded; hosted assets/analytics are documented as
+  separate page traffic.
+- [ ] No provider test requires authentication, a live service, or network access.
+
+**Order-independence is guarded by property tests** (the load-bearing invariant — ARCHITECTURE.md §1.1): `live_delivery_converges_to_bulk_ordering` (timeline.rs — 400 random per-file interleavings land the same ts sequence as the bulk sort, nothing left undated) and the model shuffle-invariance test (session.rs — final model state is a pure function of the fact set). Keep these checks in the existing inline test suite or add sanitized fixture tests without changing the provider contract.
 
 ## Pitfalls checklist (from research — verify before calling done)
 
@@ -313,7 +370,8 @@ Worth testing: transcript line parsing against real-format fixture strings (ever
 - [ ] `parentUuid` present-and-null (root) vs absent (metadata) — Option handling, lean variants for flat types
 - [ ] `is_error` missing = success
 - [ ] user content + tool_result content polymorphic string|array
-- [ ] Only `<uuid>.jsonl` in project dir + `subagents/**/agent-*.jsonl`; never skill-injections.jsonl/journal as transcript
+- [ ] Keep Claude discovery scoped to `<uuid>.jsonl` + `subagents/**/agent-*.jsonl`; keep Codex discovery scoped to `$CODEX_HOME/sessions/**/rollout-*.jsonl`; never treat provider noise files as sessions
+- [ ] Provider auto-detection is content/layout based and never merges an ambiguous directory without explicit selection
 - [ ] camera modes per the Camera section (Overview auto-fit / Follow tracking / Manual); min_zoom raised
-- [ ] No network deps anywhere in the tree
+- [ ] Native/core dependency tree has no HTTP client; browser page traffic (assets/analytics) is documented separately from local transcript processing
 - [ ] First render has zero canvas size — `request_fit_view` (deferred) not `fit_view`
