@@ -75,6 +75,10 @@ pub(crate) struct SnapshotSeed {
     pub(crate) offsets: HashMap<PathBuf, u64>,
     /// meta.json sidecars already emitted in the bulk stream.
     pub(crate) seen_meta: std::collections::HashSet<PathBuf>,
+    /// Codex record identities already emitted by the replay snapshot. New
+    /// child rollouts can copy the parent's prefix, so live tailing must seed
+    /// the same dedup set before it reads those files from offset zero.
+    pub(crate) seen_codex_ids: std::collections::HashSet<String>,
 }
 
 impl LiveSession {
@@ -115,6 +119,7 @@ impl LiveSession {
         }
         self.seed_offsets = seed.offsets;
         self.seen_meta = seed.seen_meta;
+        self.seen_codex_ids = seed.seen_codex_ids;
     }
 
     /// Register a non-main file for tailing (idempotent), starting from its
@@ -634,6 +639,77 @@ mod tests {
             "seeded metadata must not suppress rollout tracking"
         );
         assert!(updates.is_empty(), "seeded metadata is not emitted twice");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn replay_seed_deduplicates_parent_prefix_in_new_child() {
+        let dir = std::env::temp_dir().join(format!(
+            "zoetrope_codex_replay_child_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("rollout-root.jsonl");
+        std::fs::write(
+            &root,
+            concat!(
+                r#"{"timestamp":"2026-08-25T00:00:00Z","type":"session_meta","payload":{"id":"root"}}"#, "\n",
+                r#"{"timestamp":"2026-08-25T00:00:01Z","type":"response_item","payload":{"type":"message","id":"copied","role":"assistant","content":[{"type":"output_text","text":"copied"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        // The replay snapshot sees only the root. A child appears after the
+        // snapshot and starts with a copied parent prefix.
+        let (_items, _info, seed) =
+            crate::tailer::replay::build_replay_for_provider(&root, ProviderKind::Codex);
+        assert!(seed.seen_codex_ids.contains("codex:message:copied"));
+        let child = dir.join("rollout-child.jsonl");
+        std::fs::write(
+            &child,
+            concat!(
+                r#"{"timestamp":"2026-08-25T00:00:02Z","type":"session_meta","payload":{"id":"child","parent_thread_id":"root"}}"#, "\n",
+                r#"{"timestamp":"2026-08-25T00:00:03Z","type":"response_item","payload":{"type":"message","id":"copied","role":"assistant","content":[{"type":"output_text","text":"copied"}]}}"#, "\n",
+                r#"{"timestamp":"2026-08-25T00:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"child-only"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let mut session = LiveSession::new(dir.clone(), root, ProviderKind::Codex);
+        session.project_dir = None;
+        session.seed(seed);
+        let (tx, mut rx) = mpsc::channel(32);
+        poll_live(&mut session, "root", &tx).await;
+
+        let mut copied = false;
+        let mut child_only = false;
+        while let Ok(event) = rx.try_recv() {
+            let UiEvent::Batch { updates, .. } = event else {
+                continue;
+            };
+            for update in updates {
+                let Update::Entry {
+                    entry: crate::transcript::Entry::Assistant(entry),
+                    ..
+                } = update
+                else {
+                    continue;
+                };
+                for block in entry
+                    .message
+                    .map(|message| message.content)
+                    .unwrap_or_default()
+                {
+                    if let crate::transcript::ContentBlock::Text { text } = block {
+                        copied |= text == "copied";
+                        child_only |= text == "child-only";
+                    }
+                }
+            }
+        }
+        assert!(!copied, "copied parent prefix must not be replayed again");
+        assert!(child_only, "new child activity must still be emitted");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

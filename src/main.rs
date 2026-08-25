@@ -11,7 +11,6 @@
 //! zoe inspect <file.jsonl>  headless: print the session tree + info
 //! ```
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -443,11 +442,15 @@ fn detect_provider_file(path: &Path) -> Option<ProviderKind> {
     // record is malformed or an as-yet-unknown envelope. Read only a bounded
     // prefix so auto detection never loads a multi-gigabyte transcript.
     let filename_hint = transcript::is_codex_session_file(path);
-    let first_known = std::fs::File::open(path).ok().and_then(|file| {
-        BufReader::new(file)
-            .lines()
-            .take(64)
-            .filter_map(Result::ok)
+    let first_known = transcript::bounded_jsonl_lines(
+        path,
+        transcript::BOUNDED_JSONL_MAX_BYTES,
+        transcript::BOUNDED_JSONL_MAX_LINE_BYTES,
+        64,
+    )
+    .and_then(|lines| {
+        lines
+            .into_iter()
             .filter(|line| !line.trim().is_empty())
             .find_map(|line| ProviderKind::detect_line(&line))
     });
@@ -772,11 +775,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let generic = dir.join("session.jsonl");
-        std::fs::write(
-            &generic,
-            b"{\"type\":\"future_record\"}\n{\"type\":\"assistant\",\"message\":{}}\n",
-        )
-        .unwrap();
+        let mut generic_text = "x".repeat(128 * 1024);
+        generic_text.push('\n');
+        generic_text
+            .push_str("{\"type\":\"future_record\"}\n{\"type\":\"assistant\",\"message\":{}}\n");
+        std::fs::write(&generic, generic_text).unwrap();
         assert_eq!(detect_provider_file(&generic), Some(ProviderKind::Claude));
 
         let rollout = dir.join("rollout-unknown.jsonl");

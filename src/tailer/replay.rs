@@ -232,6 +232,7 @@ pub(crate) fn build_replay_for_provider(
             };
             seen.insert(id.to_owned())
         });
+        seed.seen_codex_ids = seen;
     }
     date_and_sort(&mut items);
 

@@ -1306,17 +1306,91 @@ pub fn normalize_codex_path(path: &std::path::Path) -> std::path::PathBuf {
     normalized
 }
 
+/// Bounds used while identifying a JSONL provider or reading Codex rollout
+/// metadata. A malformed single line must not make either path allocate the
+/// entire transcript into memory.
+pub const BOUNDED_JSONL_MAX_BYTES: usize = 1024 * 1024;
+pub const BOUNDED_JSONL_MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// Read a bounded JSONL prefix, skipping invalid UTF-8 and oversized lines.
+/// The byte and line limits are applied while reading, not after
+/// `read_to_string`, so an attacker-controlled rollout cannot force an
+/// unbounded allocation. A partial line at the byte limit is discarded.
+pub fn bounded_jsonl_lines(
+    path: &std::path::Path,
+    max_bytes: usize,
+    max_line_bytes: usize,
+    max_lines: usize,
+) -> Option<Vec<String>> {
+    use std::io::Read;
+
+    if max_bytes == 0 || max_line_bytes == 0 || max_lines == 0 {
+        return Some(Vec::new());
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut chunk = [0_u8; 8192];
+    let mut line = Vec::new();
+    let mut lines = Vec::new();
+    let mut total = 0;
+    let mut records = 0;
+    let mut oversized = false;
+    let mut reached_eof = false;
+
+    'read: while total < max_bytes && records < max_lines {
+        let read = reader.read(&mut chunk).ok()?;
+        if read == 0 {
+            reached_eof = true;
+            break;
+        }
+        for &byte in &chunk[..read] {
+            total += 1;
+            if !oversized {
+                if line.len() < max_line_bytes {
+                    line.push(byte);
+                } else {
+                    oversized = true;
+                }
+            }
+            if byte == b'\n' {
+                records += 1;
+                if !oversized && let Ok(text) = std::str::from_utf8(&line) {
+                    lines.push(text.trim_end_matches(['\r', '\n']).to_owned());
+                }
+                line.clear();
+                oversized = false;
+                if records >= max_lines || total >= max_bytes {
+                    break 'read;
+                }
+            }
+            if total >= max_bytes {
+                break 'read;
+            }
+        }
+    }
+
+    // `BufRead::lines` also returns a final newline-less record. Only accept it
+    // when EOF was reached naturally; a byte-capped partial record is unsafe
+    // to classify and remains skipped.
+    if reached_eof && !line.is_empty() && !oversized && records < max_lines {
+        if let Ok(text) = std::str::from_utf8(&line) {
+            lines.push(text.to_owned());
+        }
+    }
+    Some(lines)
+}
+
 /// Read only the first session metadata record from a rollout file.
 pub fn codex_session_meta(path: &std::path::Path) -> Option<CodexSessionMeta> {
-    use std::io::BufRead;
-
     if !is_codex_session_file(path) {
         return None;
     }
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    for line in reader.lines().take(256) {
-        let Ok(line) = line else { continue };
+    for line in bounded_jsonl_lines(
+        path,
+        BOUNDED_JSONL_MAX_BYTES,
+        BOUNDED_JSONL_MAX_LINE_BYTES,
+        256,
+    )? {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
@@ -1421,7 +1495,11 @@ pub fn latest_codex_session_file(root: &std::path::Path) -> Option<std::path::Pa
     fn visit(
         dir: &std::path::Path,
         depth: usize,
-        best: &mut Option<(std::time::SystemTime, std::path::PathBuf)>,
+        candidates: &mut Vec<(
+            std::time::SystemTime,
+            std::path::PathBuf,
+            Option<CodexSessionMeta>,
+        )>,
     ) {
         if depth > 4 {
             return;
@@ -1434,22 +1512,52 @@ pub fn latest_codex_session_file(root: &std::path::Path) -> Option<std::path::Pa
             if is_codex_session_file(&path) {
                 let Ok(meta) = entry.metadata() else { continue };
                 let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-                let replace = best.as_ref().is_none_or(|(old, old_path)| {
-                    modified > *old || (modified == *old && path > *old_path)
-                });
-                if replace {
-                    *best = Some((modified, path));
-                }
+                candidates.push((modified, path.clone(), codex_session_meta(&path)));
             } else if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
                 && entry.file_name().to_str() != Some("archived")
             {
-                visit(&path, depth + 1, best);
+                visit(&path, depth + 1, candidates);
             }
         }
     }
-    let mut best = None;
-    visit(root, 0, &mut best);
-    best.map(|(_, path)| path)
+    let mut candidates = Vec::new();
+    visit(root, 0, &mut candidates);
+
+    // A Codex sessions directory contains root and child rollouts side by
+    // side. The child is often written later, so mtime alone must never make
+    // it the session entry point. Prefer the newest metadata-valid rollout
+    // without a parent; if no root is available, fall back to the newest
+    // metadata-valid rollout (child-only sessions), then finally to the newest
+    // rollout path when metadata is missing or malformed.
+    let newest = |files: &Vec<(
+        std::time::SystemTime,
+        std::path::PathBuf,
+        Option<CodexSessionMeta>,
+    )>|
+     -> Option<std::path::PathBuf> {
+        files
+            .iter()
+            .max_by(|(mtime, path, _), (other_mtime, other_path, _)| {
+                mtime.cmp(other_mtime).then_with(|| path.cmp(other_path))
+            })
+            .map(|(_, path, _)| path.clone())
+    };
+    let roots: Vec<_> = candidates
+        .iter()
+        .filter(|(_, _, meta)| {
+            meta.as_ref()
+                .is_some_and(|meta| meta.parent_thread_id.as_deref().is_none_or(str::is_empty))
+        })
+        .cloned()
+        .collect();
+    let valid: Vec<_> = candidates
+        .iter()
+        .filter(|(_, _, meta)| meta.is_some())
+        .cloned()
+        .collect();
+    newest(&roots)
+        .or_else(|| newest(&valid))
+        .or_else(|| newest(&candidates))
 }
 
 // ---------------------------------------------------------------------------
@@ -2249,6 +2357,69 @@ mod tests {
     }
 
     #[test]
+    fn latest_codex_rollout_prefers_root_over_newer_child() {
+        let tmp = std::env::temp_dir().join(format!(
+            "zoetrope-codex-root-priority-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let root = tmp.join("rollout-root.jsonl");
+        let child = tmp.join("rollout-child.jsonl");
+        std::fs::write(
+            &root,
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"root\"}}\n",
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(
+            &child,
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"parent_thread_id\":\"root\"}}\n",
+        )
+        .unwrap();
+
+        assert_eq!(latest_codex_session_file(&tmp), Some(root));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn latest_codex_rollout_falls_back_to_child_then_metadata_missing() {
+        let tmp = std::env::temp_dir().join(format!(
+            "zoetrope-codex-root-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let child = tmp.join("rollout-child.jsonl");
+        let invalid = tmp.join("rollout-invalid.jsonl");
+        std::fs::write(
+            &child,
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"parent_thread_id\":\"missing-root\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(&invalid, b"not metadata\n").unwrap();
+
+        assert_eq!(
+            latest_codex_session_file(&tmp),
+            Some(child.clone()),
+            "a child-only directory prefers a metadata-valid rollout"
+        );
+        std::fs::remove_file(&child).unwrap();
+        assert_eq!(
+            latest_codex_session_file(&tmp),
+            Some(invalid),
+            "with no metadata, fallback is the newest rollout file"
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn codex_discovery_normalizes_relative_rollout_and_finds_siblings() {
         let cwd = std::env::current_dir().expect("cwd");
         let dirname = format!(
@@ -2300,6 +2471,11 @@ mod tests {
         ));
         let mut text =
             String::from("{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\"}}\n");
+        // Oversized malformed lines are discarded without growing a buffer to
+        // their full length; the valid metadata record after it remains
+        // discoverable within the bounded prefix.
+        text.push_str(&"x".repeat(128 * 1024));
+        text.push('\n');
         text.push_str("{\"type\":\"session_meta\",\"payload\":{\"id\":\"header\"}}\n");
         text.push_str(&"x".repeat(1024 * 1024));
         std::fs::write(&path, text).unwrap();
