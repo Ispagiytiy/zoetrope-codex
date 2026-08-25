@@ -694,6 +694,27 @@ pub fn is_codex_record_type(kind: &str) -> bool {
     )
 }
 
+/// Top-level record types emitted by Claude transcripts. Keep this list
+/// deliberately narrow: an unknown first record must not make `auto` commit
+/// to Claude before it has had a chance to inspect subsequent records.
+pub fn is_claude_record_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "user"
+            | "assistant"
+            | "system"
+            | "attachment"
+            | "ai-title"
+            | "last-prompt"
+            | "mode"
+            | "permission-mode"
+            | "file-history-snapshot"
+            | "queue-operation"
+            | "started"
+            | "result"
+    )
+}
+
 fn codex_timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
     value
         .get("timestamp")
@@ -725,6 +746,11 @@ fn codex_id(value: &serde_json::Value, payload: &serde_json::Value) -> Option<St
             "message_id",
             "event_id",
             "call_id",
+            "callId",
+            "command_id",
+            "commandId",
+            "patch_id",
+            "patchId",
             "thread_id",
         ],
     )
@@ -748,6 +774,22 @@ fn codex_envelope(value: &serde_json::Value, payload: &serde_json::Value) -> Env
         attribution_agent: None,
         origin: None,
     }
+}
+
+/// Give normalized Codex records a provider-local identity that includes the
+/// record kind. A function call and its output intentionally share a
+/// `call_id`, but they are distinct timeline events and must not be removed by
+/// child-prefix deduplication. Claude UUIDs are left untouched.
+fn codex_envelope_with_kind(
+    value: &serde_json::Value,
+    payload: &serde_json::Value,
+    record_kind: &str,
+) -> Envelope {
+    let mut envelope = codex_envelope(value, payload);
+    if let Some(id) = envelope.uuid.take() {
+        envelope.uuid = Some(format!("codex:{record_kind}:{id}"));
+    }
+    envelope
 }
 
 fn codex_text(value: Option<&serde_json::Value>) -> Option<String> {
@@ -828,6 +870,12 @@ fn codex_tool_input(payload: &serde_json::Value) -> serde_json::Value {
 }
 
 fn codex_result_is_error(payload: &serde_json::Value) -> Option<bool> {
+    // `success` is authoritative in Codex command/patch end records. Some
+    // versions include a contradictory status or stale `is_error` field, so
+    // resolve it before all legacy indicators.
+    if let Some(success) = payload.get("success").and_then(serde_json::Value::as_bool) {
+        return Some(!success);
+    }
     if let Some(error) = payload.get("is_error").and_then(serde_json::Value::as_bool) {
         return Some(error);
     }
@@ -854,9 +902,10 @@ fn codex_result_is_error(payload: &serde_json::Value) -> Option<bool> {
 fn codex_tool_result(
     value: &serde_json::Value,
     payload: &serde_json::Value,
+    record_kind: &str,
     output: Option<&serde_json::Value>,
 ) -> Entry {
-    let envelope = codex_envelope(value, payload);
+    let envelope = codex_envelope_with_kind(value, payload, record_kind);
     let tool_use_id = codex_string(
         Some(payload),
         &["call_id", "callId", "command_id", "patch_id", "id"],
@@ -883,9 +932,13 @@ fn codex_tool_result(
 }
 
 fn codex_task_entry(value: &serde_json::Value, payload: &serde_json::Value, status: &str) -> Entry {
-    let envelope = codex_envelope(value, payload);
-    let id = codex_string(Some(payload), &["thread_id", "threadId", "id"])
-        .unwrap_or_else(|| "codex-task".to_owned());
+    let record_kind = format!("task_{status}");
+    let envelope = codex_envelope_with_kind(value, payload, &record_kind);
+    let id = codex_string(
+        Some(payload),
+        &["thread_id", "threadId", "turn_id", "turnId", "id"],
+    )
+    .unwrap_or_default();
     let text = format!(
         "<task-notification>\n<task-id>{id}</task-id>\n<status>{status}</status>\n</task-notification>"
     );
@@ -920,7 +973,7 @@ fn parse_codex_record(value: &serde_json::Value) -> Option<Entry> {
                 let role = codex_string(Some(payload), &["role"])
                     .unwrap_or_else(|| "assistant".to_owned());
                 let content = codex_text_blocks(payload.get("content"), false);
-                let envelope = codex_envelope(value, payload);
+                let envelope = codex_envelope_with_kind(value, payload, "message");
                 if role == "user" {
                     let text = content
                         .iter()
@@ -952,7 +1005,7 @@ fn parse_codex_record(value: &serde_json::Value) -> Option<Entry> {
                 }
             }
             "reasoning" => Some(Entry::Assistant(Box::new(AssistantEntry {
-                envelope: codex_envelope(value, payload),
+                envelope: codex_envelope_with_kind(value, payload, "reasoning"),
                 message: Some(AssistantMessage {
                     role: Some("assistant".to_owned()),
                     model: None,
@@ -967,8 +1020,12 @@ fn parse_codex_record(value: &serde_json::Value) -> Option<Entry> {
             "function_call" | "custom_tool_call" => {
                 let id = codex_string(Some(payload), &["call_id", "callId", "id"]);
                 let name = codex_string(Some(payload), &["name", "tool_name"]);
+                let record_kind = payload
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool_call");
                 Some(Entry::Assistant(Box::new(AssistantEntry {
-                    envelope: codex_envelope(value, payload),
+                    envelope: codex_envelope_with_kind(value, payload, record_kind),
                     message: Some(AssistantMessage {
                         role: Some("assistant".to_owned()),
                         model: None,
@@ -986,6 +1043,10 @@ fn parse_codex_record(value: &serde_json::Value) -> Option<Entry> {
             "function_call_output" | "custom_tool_call_output" => Some(codex_tool_result(
                 value,
                 payload,
+                payload
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool_output"),
                 payload.get("output").or_else(|| payload.get("result")),
             )),
             _ => None,
@@ -996,7 +1057,7 @@ fn parse_codex_record(value: &serde_json::Value) -> Option<Entry> {
                 "user_message" => {
                     let text = codex_text(payload.get("message").or_else(|| payload.get("text")))?;
                     Some(Entry::User(Box::new(UserEntry {
-                        envelope: codex_envelope(value, payload),
+                        envelope: codex_envelope_with_kind(value, payload, "user_message"),
                         message: Some(UserMessage {
                             role: Some("user".to_owned()),
                             content: Some(UserContent::Text(text)),
@@ -1007,7 +1068,7 @@ fn parse_codex_record(value: &serde_json::Value) -> Option<Entry> {
                 "agent_message" => {
                     let text = codex_text(payload.get("message").or_else(|| payload.get("text")))?;
                     Some(Entry::Assistant(Box::new(AssistantEntry {
-                        envelope: codex_envelope(value, payload),
+                        envelope: codex_envelope_with_kind(value, payload, "agent_message"),
                         message: Some(AssistantMessage {
                             role: Some("assistant".to_owned()),
                             model: None,
@@ -1020,7 +1081,7 @@ fn parse_codex_record(value: &serde_json::Value) -> Option<Entry> {
                 "agent_reasoning" => {
                     let text = codex_text(payload.get("text").or_else(|| payload.get("message")))?;
                     Some(Entry::Assistant(Box::new(AssistantEntry {
-                        envelope: codex_envelope(value, payload),
+                        envelope: codex_envelope_with_kind(value, payload, "agent_reasoning"),
                         message: Some(AssistantMessage {
                             role: Some("assistant".to_owned()),
                             model: None,
@@ -1036,13 +1097,14 @@ fn parse_codex_record(value: &serde_json::Value) -> Option<Entry> {
                 "exec_command_end" | "patch_apply_end" => Some(codex_tool_result(
                     value,
                     payload,
+                    event_type,
                     payload
                         .get("output")
                         .or_else(|| payload.get("result"))
                         .or_else(|| payload.get("message")),
                 )),
                 "token_count" => {
-                    let mut envelope = codex_envelope(value, payload);
+                    let mut envelope = codex_envelope_with_kind(value, payload, "token_count");
                     envelope.request_id = Some("codex-token-total".to_owned());
                     let usage = codex_usage(payload)?;
                     Some(Entry::Assistant(Box::new(AssistantEntry {
@@ -1217,14 +1279,45 @@ pub fn is_codex_session_file(path: &std::path::Path) -> bool {
             .is_some_and(|name| name.starts_with("rollout-"))
 }
 
+/// Normalize a rollout path before comparing it with paths returned by
+/// directory scans. In particular, `Path::parent()` for a bare relative file
+/// is an empty path; resolving it here gives sibling discovery a real absolute
+/// directory and keeps replay/live tracking keys consistent.
+pub fn normalize_codex_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut normalized = std::path::PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 /// Read only the first session metadata record from a rollout file.
 pub fn codex_session_meta(path: &std::path::Path) -> Option<CodexSessionMeta> {
+    use std::io::BufRead;
+
     if !is_codex_session_file(path) {
         return None;
     }
-    let text = std::fs::read_to_string(path).ok()?;
-    for line in text.lines().take(256) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines().take(256) {
+        let Ok(line) = line else { continue };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
         if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
@@ -1258,6 +1351,7 @@ pub fn scan_codex_session_files(main_path: &std::path::Path) -> Vec<CodexSession
     if !is_codex_session_file(main_path) {
         return Vec::new();
     }
+    let main_path = normalize_codex_path(main_path);
     let Some(dir) = main_path.parent() else {
         return Vec::new();
     };
@@ -1281,7 +1375,7 @@ pub fn scan_codex_session_files(main_path: &std::path::Path) -> Vec<CodexSession
         .and_then(|f| f.meta.as_ref())
         .map(|m| m.session_id.clone());
     let mut included = std::collections::HashSet::new();
-    included.insert(main_path.to_path_buf());
+    included.insert(main_path.clone());
     if let Some(target_id) = target_id {
         // Repeatedly add records whose parent is already included. The ids are
         // small and day directories are bounded, so a fixed-point pass is both
@@ -1475,6 +1569,7 @@ mod tests {
             r#"{"timestamp":"2026-08-25T01:02:04Z","type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"exec_command","arguments":"{\"cmd\":\"rg TODO\"}"}}"#,
         )
         .expect("function call is recognized");
+        let call_identity = entry_identity(&call).expect("call identity").to_owned();
         match call {
             Entry::Assistant(entry) => {
                 assert_eq!(
@@ -1492,6 +1587,11 @@ mod tests {
             r#"{"timestamp":"2026-08-25T01:02:05Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"ok"}}"#,
         )
         .expect("function output is recognized");
+        let output_identity = entry_identity(&output).expect("output identity").to_owned();
+        assert_ne!(
+            call_identity, output_identity,
+            "call and result share call_id but must remain distinct records"
+        );
         match output {
             Entry::User(entry) => assert!(matches!(
                 entry.message.and_then(|m| m.content),
@@ -1532,6 +1632,23 @@ mod tests {
         .unwrap();
         assert!(matches!(
             patch_end,
+            Entry::User(entry)
+                if matches!(
+                    entry.message.as_ref().and_then(|m| m.content.as_ref()),
+                    Some(UserContent::Blocks(blocks))
+                        if blocks.iter().any(|block| matches!(
+                            block,
+                            UserContentBlock::ToolResult(result) if result.is_error == Some(true)
+                        ))
+                )
+        ));
+
+        let contradictory_patch = parse_line(
+            r#"{"timestamp":"2026-08-25T01:02:07Z","type":"event_msg","payload":{"type":"patch_apply_end","patch_id":"patch-2","success":false,"status":"completed","is_error":false,"output":"reject"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            contradictory_patch,
             Entry::User(entry)
                 if matches!(
                     entry.message.as_ref().and_then(|m| m.content.as_ref()),
@@ -2129,5 +2246,68 @@ mod tests {
         assert_ne!(latest_codex_session_file(&tmp), Some(archived_rollout));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn codex_discovery_normalizes_relative_rollout_and_finds_siblings() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let dirname = format!(
+            ".zoetrope-codex-relative-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let absolute_dir = cwd.join(&dirname);
+        std::fs::create_dir_all(&absolute_dir).expect("mkdir");
+        let absolute_root = absolute_dir.join("rollout-root.jsonl");
+        let absolute_child = absolute_dir.join("rollout-child.jsonl");
+        std::fs::write(
+            &absolute_root,
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"root\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &absolute_child,
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"parent_thread_id\":\"root\"}}\n",
+        )
+        .unwrap();
+
+        let relative_root = Path::new(".").join(&dirname).join("rollout-root.jsonl");
+        let found = scan_codex_session_files(&relative_root);
+        assert_eq!(
+            found.len(),
+            2,
+            "relative bare parent must still scan siblings"
+        );
+        assert_eq!(found[0].path, normalize_codex_path(&relative_root));
+        assert_eq!(found[1].path, normalize_codex_path(&absolute_child));
+        assert!(normalize_codex_path(&relative_root).is_absolute());
+
+        let _ = std::fs::remove_dir_all(absolute_dir);
+    }
+
+    #[test]
+    fn codex_session_meta_returns_from_bounded_header_before_large_suffix() {
+        let path = std::env::temp_dir().join(format!(
+            "rollout-meta-header-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut text =
+            String::from("{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\"}}\n");
+        text.push_str("{\"type\":\"session_meta\",\"payload\":{\"id\":\"header\"}}\n");
+        text.push_str(&"x".repeat(1024 * 1024));
+        std::fs::write(&path, text).unwrap();
+
+        assert_eq!(
+            codex_session_meta(&path).map(|meta| meta.session_id),
+            Some("header".into())
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

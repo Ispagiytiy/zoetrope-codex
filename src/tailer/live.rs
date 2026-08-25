@@ -478,8 +478,9 @@ fn scan_files(session: &mut LiveSession, updates: &mut Vec<Update>) {
     if session.provider == ProviderKind::Codex {
         let root_id =
             transcript::codex_session_meta(&session.main_path).map(|meta| meta.session_id);
+        let normalized_main_path = transcript::normalize_codex_path(&session.main_path);
         for file in transcript::scan_codex_session_files(&session.main_path) {
-            if file.path == session.main_path {
+            if file.path == normalized_main_path {
                 continue;
             }
             let Some(meta) = file.meta else { continue };
@@ -489,9 +490,11 @@ fn scan_files(session: &mut LiveSession, updates: &mut Vec<Update>) {
                 .filter(|parent| root_id.as_deref() != Some(*parent))
                 .map(|parent| format!("{}{}", transcript::CODEX_PARENT_PREFIX, parent));
             let agent_id = meta.session_id.clone();
-            if session.track_codex_meta(&file.path, agent_id.clone(), parent, &meta, updates) {
-                session.track(file.path, Source::Sub(agent_id));
-            }
+            let _ = session.track_codex_meta(&file.path, agent_id.clone(), parent, &meta, updates);
+            // Replay may already have emitted this metadata. The rollout file
+            // itself must still be tracked so appends after replay are never
+            // lost merely because its virtual meta marker was seen.
+            session.track(file.path, Source::Sub(agent_id));
         }
         return;
     }
@@ -597,6 +600,41 @@ mod tests {
         assert_eq!(updates.len(), 1);
         assert!(seen.contains(&tmp));
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn codex_scan_tracks_child_even_when_meta_was_seeded() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("zoetrope_codex_track_seed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("rollout-root.jsonl");
+        let child = dir.join("rollout-child.jsonl");
+        std::fs::write(
+            &root,
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"root\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &child,
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"parent_thread_id\":\"root\"}}\n",
+        )
+        .unwrap();
+
+        let mut session = LiveSession::new(dir.clone(), root.clone(), ProviderKind::Codex);
+        // Replay already emitted the virtual metadata marker. The file still
+        // needs a live tail registration for lines appended afterwards.
+        session.seen_meta.insert(child.clone());
+        let mut updates = Vec::new();
+        scan_files(&mut session, &mut updates);
+
+        let normalized_child = transcript::normalize_codex_path(&child);
+        assert!(
+            session.tracked.contains_key(&normalized_child),
+            "seeded metadata must not suppress rollout tracking"
+        );
+        assert!(updates.is_empty(), "seeded metadata is not emitted twice");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

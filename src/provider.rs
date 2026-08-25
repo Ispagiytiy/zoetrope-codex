@@ -32,8 +32,13 @@ impl ProviderKind {
         let kind = value.get("type")?.as_str()?;
         if crate::transcript::is_codex_record_type(kind) {
             Some(Self::Codex)
-        } else {
+        } else if crate::transcript::is_claude_record_type(kind) {
             Some(Self::Claude)
+        } else {
+            // Unknown records are deliberately inconclusive. The caller may
+            // inspect a few more lines (or use a rollout filename hint) before
+            // selecting a provider.
+            None
         }
     }
 }
@@ -84,6 +89,10 @@ mod tests {
         assert_eq!(
             ProviderKind::detect_line(r#"{"type":"assistant","message":{}}"#),
             Some(ProviderKind::Claude)
+        );
+        assert_eq!(
+            ProviderKind::detect_line(r#"{"type":"future_record"}"#),
+            None
         );
     }
 }

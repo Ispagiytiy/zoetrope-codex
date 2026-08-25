@@ -485,7 +485,15 @@ impl SessionModel {
                     && let Some(text) = e.prompt_text()
                     && let Some(tn) = crate::transcript::parse_task_notification(text)
                 {
-                    self.apply_task_notification(&tn);
+                    // Codex child rollouts may identify lifecycle events by
+                    // `turn_id` (or omit an id entirely). The source file is
+                    // authoritative ownership; never create/apply a phantom
+                    // `codex-task` node from a payload id.
+                    if let Source::Sub(owner) = source {
+                        let mut owned = tn;
+                        owned.agent_id.clone_from(owner);
+                        self.apply_task_notification(&owned);
+                    }
                 }
                 // tool_result blocks complete tool calls (and, in the main
                 // transcript, direct-subagent + workflow nodes).
@@ -1471,6 +1479,58 @@ mod tests {
             m.prompts.is_empty(),
             "a task-notification must not pollute the prompt spine"
         );
+    }
+
+    #[test]
+    fn codex_child_task_complete_uses_source_owner_for_turn_only_events() {
+        let line = r#"{"timestamp":"2026-08-25T10:00:00Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-123","status":"failed"}}"#;
+        let entry = crate::transcript::parse_line(line).expect("Codex lifecycle parses");
+        let mut model = SessionModel::new("root".into());
+        model.apply_update(&Update::Entry {
+            source: Source::Sub("child-rollout".into()),
+            entry,
+        });
+
+        assert_eq!(
+            model.agent("child-rollout").map(|agent| agent.status),
+            Some(AgentStatus::Failed),
+            "child source owns a turn_id-only lifecycle record"
+        );
+        assert!(model.agent("turn-123").is_none());
+        assert!(model.agent("codex-task").is_none());
+    }
+
+    #[test]
+    fn codex_function_custom_exec_and_patch_records_complete_tools() {
+        let lines = [
+            r#"{"timestamp":"2026-08-25T10:00:00Z","type":"response_item","payload":{"type":"function_call","call_id":"function-1","name":"exec_command","arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-08-25T10:00:01Z","type":"response_item","payload":{"type":"function_call_output","call_id":"function-1","output":"ok"}}"#,
+            r#"{"timestamp":"2026-08-25T10:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"custom-1","name":"apply_patch","input":{}}}"#,
+            r#"{"timestamp":"2026-08-25T10:00:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"custom-1","output":"ok"}}"#,
+            r#"{"timestamp":"2026-08-25T10:00:04Z","type":"response_item","payload":{"type":"function_call","call_id":"exec-1","name":"exec_command","arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-08-25T10:00:05Z","type":"event_msg","payload":{"type":"exec_command_end","command_id":"exec-1","success":true,"output":"done"}}"#,
+            r#"{"timestamp":"2026-08-25T10:00:06Z","type":"response_item","payload":{"type":"function_call","call_id":"patch-1","name":"apply_patch","arguments":"{}"}}"#,
+            r#"{"timestamp":"2026-08-25T10:00:07Z","type":"event_msg","payload":{"type":"patch_apply_end","patch_id":"patch-1","success":false,"output":"reject"}}"#,
+        ];
+        let mut model = SessionModel::new("root".into());
+        for line in lines {
+            model.apply_update(&Update::Entry {
+                source: Source::Main,
+                entry: crate::transcript::parse_line(line).expect("Codex record parses"),
+            });
+        }
+
+        let calls = &model.agent(MAIN_ID).unwrap().tool_calls;
+        let state = |id: &str| {
+            calls
+                .iter()
+                .find(|call| call.id == id)
+                .map(|call| call.state)
+        };
+        assert_eq!(state("function-1"), Some(ToolState::Ok));
+        assert_eq!(state("custom-1"), Some(ToolState::Ok));
+        assert_eq!(state("exec-1"), Some(ToolState::Ok));
+        assert_eq!(state("patch-1"), Some(ToolState::Err));
     }
 
     #[test]

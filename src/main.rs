@@ -11,6 +11,7 @@
 //! zoe inspect <file.jsonl>  headless: print the session tree + info
 //! ```
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -76,10 +77,27 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
         .map(|value| value.parse::<ProviderKind>().map_err(|e| anyhow!(e)))
         .transpose()?;
 
+    // Accept the provider as a global flag before the `inspect` command as
+    // well as in the command's own flag position (`zoe --provider codex
+    // inspect file` and `zoe inspect file --provider codex`).
+    let leading_provider = if args.peek().map(String::as_str) == Some("--provider") {
+        args.next();
+        let value = args
+            .next()
+            .ok_or_else(|| anyhow!("--provider requires auto, claude, or codex\n\n{USAGE}"))?;
+        Some(
+            value
+                .parse::<ProviderKind>()
+                .map_err(|e: String| anyhow!(e))?,
+        )
+    } else {
+        None
+    };
+
     // `inspect <file>` is the one distinct (headless) subcommand.
     if args.peek().map(String::as_str) == Some("inspect") {
         args.next();
-        let mut provider = env_provider.unwrap_or_default();
+        let mut provider = leading_provider.or(env_provider).unwrap_or_default();
         let mut file: Option<PathBuf> = None;
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -106,7 +124,7 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
     let mut target: Option<PathBuf> = None;
     let mut follow = false;
     let mut speed = DEFAULT_REPLAY_SPEED;
-    let mut provider = env_provider.unwrap_or_default();
+    let mut provider = leading_provider.or(env_provider).unwrap_or_default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -209,9 +227,10 @@ fn parse_session_fully_with_provider(
         || (provider == ProviderKind::Auto && transcript::is_codex_session_file(main_file));
 
     if is_codex {
+        let normalized_main_file = transcript::normalize_codex_path(main_file);
         let root_id = transcript::codex_session_meta(main_file).map(|meta| meta.session_id);
         for file in transcript::scan_codex_session_files(main_file) {
-            if file.path == main_file {
+            if file.path == normalized_main_file {
                 continue;
             }
             let Some(meta) = file.meta else { continue };
@@ -420,11 +439,23 @@ fn print_agent_tree(model: &SessionModel, parent: Option<&str>, depth: usize) {
 /// A malformed/empty file remains Claude-compatible: the existing parser will
 /// safely skip it and the caller can still inspect the resulting empty model.
 fn detect_provider_file(path: &Path) -> Option<ProviderKind> {
-    std::fs::read_to_string(path).ok().and_then(|text| {
-        text.lines()
+    // Codex's rollout filename is an unambiguous hint even when its first
+    // record is malformed or an as-yet-unknown envelope. Read only a bounded
+    // prefix so auto detection never loads a multi-gigabyte transcript.
+    let filename_hint = transcript::is_codex_session_file(path);
+    let first_known = std::fs::File::open(path).ok().and_then(|file| {
+        BufReader::new(file)
+            .lines()
+            .take(64)
+            .filter_map(Result::ok)
             .filter(|line| !line.trim().is_empty())
-            .find_map(ProviderKind::detect_line)
-    })
+            .find_map(|line| ProviderKind::detect_line(&line))
+    });
+    if filename_hint {
+        Some(ProviderKind::Codex)
+    } else {
+        first_known
+    }
 }
 
 /// Resolve a `View` invocation into (session id, watch target, mode, feeder,
@@ -697,6 +728,10 @@ mod tests {
             Cli::Inspect { provider, .. } => assert_eq!(provider, ProviderKind::Claude),
             other => panic!("got {other:?}"),
         }
+        match cli(&["--provider", "codex", "inspect", "session.jsonl"]).unwrap() {
+            Cli::Inspect { provider, .. } => assert_eq!(provider, ProviderKind::Codex),
+            other => panic!("got {other:?}"),
+        }
         assert!(cli(&["--provider", "invalid"]).is_err());
     }
 
@@ -719,8 +754,36 @@ mod tests {
             }
             other => panic!("got {other:?}"),
         }
+        match cli(&["--provider", "codex", "inspect", "s.jsonl"]).unwrap() {
+            Cli::Inspect { file, provider } => {
+                assert_eq!(file, PathBuf::from("s.jsonl"));
+                assert_eq!(provider, ProviderKind::Codex);
+            }
+            other => panic!("got {other:?}"),
+        }
         assert!(cli(&["inspect"]).is_err());
         assert!(cli(&["inspect", "a", "b"]).is_err());
+    }
+
+    #[test]
+    fn auto_detection_skips_unknown_prefix_and_uses_rollout_hint() {
+        let dir =
+            std::env::temp_dir().join(format!("zoetrope-provider-detect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let generic = dir.join("session.jsonl");
+        std::fs::write(
+            &generic,
+            b"{\"type\":\"future_record\"}\n{\"type\":\"assistant\",\"message\":{}}\n",
+        )
+        .unwrap();
+        assert_eq!(detect_provider_file(&generic), Some(ProviderKind::Claude));
+
+        let rollout = dir.join("rollout-unknown.jsonl");
+        std::fs::write(&rollout, b"{\"type\":\"future_record\"}\n").unwrap();
+        assert_eq!(detect_provider_file(&rollout), Some(ProviderKind::Codex));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

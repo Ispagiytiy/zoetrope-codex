@@ -135,10 +135,11 @@ pub(crate) fn build_replay_for_provider(
     // Codex keeps root and child rollouts side by side in a date directory.
     // Only the target and its parent-linked descendants are included.
     if detected_codex {
+        let normalized_main_path = transcript::normalize_codex_path(main_path);
         let files = transcript::scan_codex_session_files(main_path);
         let root_id = transcript::codex_session_meta(main_path).map(|meta| meta.session_id);
         for file in files {
-            let is_main = file.path == main_path;
+            let is_main = file.path == normalized_main_path;
             if !is_main {
                 let Some(meta) = &file.meta else { continue };
                 let agent_id = meta.session_id.clone();
@@ -457,7 +458,7 @@ mod tests {
             build_replay_for_provider(&root, crate::provider::ProviderKind::Codex);
         let copied = items
             .iter()
-            .filter(|item| matches!(&item.update, Update::Entry { entry: crate::transcript::Entry::Assistant(entry), .. } if entry.envelope.uuid.as_deref() == Some("same")))
+            .filter(|item| matches!(&item.update, Update::Entry { entry: crate::transcript::Entry::Assistant(entry), .. } if entry.envelope.uuid.as_deref() == Some("codex:message:same")))
             .count();
         assert_eq!(copied, 1, "copied parent history appears once");
         assert!(items.iter().any(|item| matches!(
@@ -474,6 +475,49 @@ mod tests {
             &item.update,
             Update::Entry { source: Source::Sub(id), .. } if id == "child"
         )));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codex_replay_keeps_call_output_and_end_with_shared_call_id() {
+        let dir =
+            std::env::temp_dir().join(format!("zoetrope-codex-record-kind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("rollout-root.jsonl");
+        std::fs::write(
+            &root,
+            concat!(
+                r#"{"timestamp":"2026-08-25T00:00:00Z","type":"session_meta","payload":{"id":"root"}}"#, "\n",
+                r#"{"timestamp":"2026-08-25T00:00:01Z","type":"response_item","payload":{"type":"function_call","call_id":"same","name":"exec_command","arguments":"{}"}}"#, "\n",
+                r#"{"timestamp":"2026-08-25T00:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"same","output":"ok"}}"#, "\n",
+                r#"{"timestamp":"2026-08-25T00:00:03Z","type":"event_msg","payload":{"type":"patch_apply_end","patch_id":"same","success":true,"output":"applied"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let (items, _info, _seed) =
+            build_replay_for_provider(&root, crate::provider::ProviderKind::Codex);
+        let identities: Vec<_> = items
+            .iter()
+            .filter_map(|item| match &item.update {
+                Update::Entry { entry, .. } => crate::transcript::entry_identity(entry),
+                Update::SubagentMeta { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            identities.len(),
+            3,
+            "call, output, and end all survive dedup"
+        );
+        assert!(identities.iter().any(|id| id.contains("function_call:")));
+        assert!(
+            identities
+                .iter()
+                .any(|id| id.contains("function_call_output:"))
+        );
+        assert!(identities.iter().any(|id| id.contains("patch_apply_end:")));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
