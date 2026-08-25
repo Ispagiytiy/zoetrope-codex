@@ -1,6 +1,6 @@
 ---
 title: Install
-description: Install the zoetrope terminal app with Homebrew, cargo or a prebuilt binary (or build it from source), or skip the install and run it in your browser.
+description: Install the zoetrope terminal app for Claude Code and Codex sessions with Homebrew, cargo or a prebuilt binary, or run it in your browser.
 ---
 
 zoetrope runs two ways: a terminal app you install, or the same portable core
@@ -13,9 +13,40 @@ open, and from there you can browse your own sessions or drop in a transcript.
 
 - **[Open the browser app →](/app)**
 
-It runs entirely on your machine (it's WebAssembly served as a static page); your
-transcripts are never uploaded. See [Usage & keys](/guides/usage/) for the controls,
-which are identical to the native app.
+The parser runs in your browser. When you choose a folder or files, the selected log
+bytes are read locally and are not uploaded by zoetrope. The hosted page still loads
+its static assets and may load site analytics. Those page requests are separate from
+transcript processing. See [Usage & keys](/guides/usage/) for the controls, which are
+identical to the native app.
+
+### Choose a provider
+
+The terminal app supports both providers without credentials or network access to
+either service. Keep the existing Claude Code default, or select the provider when
+you launch:
+
+```sh
+zoe --provider claude
+zoe --provider codex
+zoe --provider auto
+```
+
+Claude Code sessions normally live below `~/.claude/projects/`. Codex CLI sessions
+normally live below `$CODEX_HOME/sessions/YYYY/MM/DD/`; when `CODEX_HOME` is unset,
+it defaults to `~/.codex`. You can also pass an explicit transcript file or directory
+to avoid discovery:
+
+```sh
+zoe --provider codex /path/to/rollout.jsonl
+zoe --provider auto /path/to/session-or-provider-directory
+```
+
+Native `auto` keeps Claude Code precedence for backwards compatibility when both
+provider stores are available; use `--provider codex` to select Codex explicitly and
+to respect an explicit Codex file or directory. A concrete file detected as the other
+provider is rejected when an explicit provider is selected. The browser picker has a
+stricter rule: mixed Claude/Codex selections are an explicit error, so choose one
+provider before opening the files or folder.
 
 ## Install the terminal app
 
@@ -74,6 +105,8 @@ cargo build --release
 - Building (`cargo install` or from source) needs a recent stable Rust toolchain
   (`rustup` recommended).
 - A terminal that supports truecolor and mouse events (most modern terminals do).
+- No Claude Code or Codex login is needed: zoetrope only reads the local transcript
+  files you select.
 
 ## Build the browser app yourself
 
@@ -97,8 +130,17 @@ and `trunk` (`cargo install trunk`). `pnpm build:wasm` (that is,
 with `cd web/wasm && cargo clippy` — that crate's `.cargo/config.toml` defaults the
 target to wasm32, so no flags are needed.
 
+## Privacy and transcript safety
+
+JSONL logs can include prompts, working directories, file paths, tool inputs and
+outputs, source snippets, and model metadata. Treat them as sensitive. In the browser,
+you choose the folder or files yourself; the page does not get access to other local
+folders, and selected log bytes stay in the browser. Do not upload raw logs to an issue
+or share them as fixtures—redact or synthesize examples instead.
+
 ## Status
 
-Early and pre-release. It's usable for dogfooding your own sessions, but the keys,
-CLI, and the on-disk format it reads may still shift. If something looks wrong,
-please [open an issue](https://github.com/furkankly/zoetrope/issues).
+Early and pre-release. It's usable for dogfooding your own Claude Code or Codex
+sessions, but the keys, CLI, and provider-specific on-disk formats it reads may still
+shift. If something looks wrong, please
+[open an issue](https://github.com/furkankly/zoetrope/issues) with a sanitized example.

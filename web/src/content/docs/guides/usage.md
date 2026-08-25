@@ -1,6 +1,6 @@
 ---
 title: Usage & keys
-description: How to launch zoetrope at a live session or a saved transcript, and the full key map for scrubbing, camera, and overlays.
+description: How to launch zoetrope for Claude Code or Codex sessions, choose a provider, and use the full key map for scrubbing, camera, and overlays.
 ---
 
 The launch only picks the **defaults**: *what* to open and *where the playhead
@@ -16,31 +16,62 @@ zoe <file.jsonl>             replay a recording from the start, paced
 zoe <file.jsonl> --follow    open a recording at its live edge instead
 zoe <file.jsonl> --speed N   playback speed multiplier (default 8.0)
 zoe inspect <file.jsonl>     print the session tree and exit (no TUI)
+
+zoe --provider claude        use Claude Code's local session store
+zoe --provider codex         use Codex CLI's local session store
+zoe --provider auto          detect a known provider layout or record shape
+zoe --provider codex <dir>   follow a Codex session directory
+zoe --provider auto <file>   detect the provider for one explicit file
+zoe inspect <file.jsonl> --provider codex
 ```
 
 A **file** target bulk-loads then tails it; a **directory** (or none → the current
 project) discovers the latest session and follows it live. `--follow` only changes
-where the playhead starts (the live edge instead of the beginning).
+where the playhead starts (the live edge instead of the beginning). An explicit file
+is always read as that session and does not mix neighboring provider files. Native
+`auto` keeps Claude Code precedence for backwards compatibility when both provider
+stores are available; use an explicit `--provider codex` to select Codex. A concrete
+file detected as the other provider is rejected when an explicit provider is selected.
+The browser picker is stricter: mixed Claude/Codex selections are an error, so choose
+one provider before opening them.
+
+### Session locations
+
+Claude Code's default session store is `~/.claude/projects/<sanitized-cwd>/`.
+Codex CLI's default session store is `$CODEX_HOME/sessions/YYYY/MM/DD/`, with
+`$CODEX_HOME` defaulting to `~/.codex`. Set `CODEX_HOME` before launching to inspect
+another Codex store, or pass the exact file/directory path directly. The app is
+read-only and does not ask either provider for credentials.
 
 ## Launching (browser)
 
 The [browser app](/app) boots into a bundled demo. To watch your own session:
 
-- **Sessions** (Chromium browsers): click **Sessions** to browse your Claude
-  projects, pick one, and follow it live. zoetrope reads the main transcript plus its
-  subagents, then tails the folder for new activity. This is the same "follow a
-  running session" flow as the native app, built on the File System Access API.
-  Nothing is uploaded.
+- **Sessions** (Chromium browsers): click **Sessions**, choose Claude Code or Codex,
+  pick a local folder, and follow it live when the browser supports the File System
+  Access API. zoetrope reads the selected provider's transcript files and tails the
+  folder for new activity. Codex live-follow re-scans the selected sessions tree as it
+  polls, so child rollout files created after opening can join the graph. Nothing from
+  the selected logs is uploaded by zoetrope.
 - **Sessions** (other browsers): the same button falls back to a folder picker,
   so browsing and replaying work everywhere. **Following live does not** — without
   the File System Access API the browser hands over an immutable *snapshot* of
   each file, so writes that happen after you pick never arrive. The picker says
   so before you choose. Live-follow needs Chrome or Edge (or the native TUI).
 - **Drag and drop** a `.jsonl` transcript (any browser). A drop carries only what
-  you dropped, and nothing in a transcript points at its sidecar files — so drag
-  the `<uuid>.jsonl` **and** its `<uuid>/` folder together to get subagents and
-  workflows. Drop the transcript alone and you get the main agent only; zoetrope
-  will say so rather than pretending the session had no subagents.
+  you dropped. For Claude, drag the `<uuid>.jsonl` **and** its `<uuid>/` folder together
+  to include sidecar subagents and workflows. For Codex, include the rollout files you
+  want to inspect; a mixed Claude/Codex drop in `auto` is rejected, so choose one
+  provider explicitly.
+
+### Privacy when using the browser
+
+You choose the folder or files in the browser picker; zoetrope does not discover or
+read unrelated folders. JSONL can contain prompts, working directories, file paths,
+tool inputs and outputs, source snippets, and model metadata, so treat it as sensitive
+and do not drop raw logs into public issues. The selected log bytes stay in the page and
+are not uploaded by the app. The hosted page may still request its own assets, fonts,
+or analytics.
 
 ## Keys
 
