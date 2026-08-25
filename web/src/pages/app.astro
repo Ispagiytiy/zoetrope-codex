@@ -3,7 +3,8 @@
 // docs route). It loads the WebAssembly build (the Rust `web` bin, compiled by
 // `pnpm build:wasm` into /public/wasm) which boots into the bundled demo, then
 // lets you replay your own transcript or — in Chromium — open a session folder
-// and follow it live. Everything runs locally; nothing is uploaded.
+// and follow it live. Transcript bytes are processed locally and are not uploaded
+// by the app; the hosted page may still load its own assets and analytics.
 import { Font } from 'astro:assets';
 import Analytics from '../components/Analytics.astro';
 import Seo from '../components/Seo.astro';
@@ -21,12 +22,12 @@ const wasmBase = '/wasm';
     <title>zoetrope — browser app</title>
     <meta
       name="description"
-      content="Run zoetrope in your browser: replay Claude Code or Codex session transcripts as a live flow graph, fully locally."
+      content="Run zoetrope in your browser: replay Claude Code or Codex session transcripts as a live flow graph. Transcript bytes are processed locally and are not uploaded."
     />
     <Schema />
     <Seo
       title="zoetrope — browser app"
-      description="Run zoetrope in your browser: replay Claude Code or Codex session transcripts as a live flow graph, fully locally."
+      description="Run zoetrope in your browser: replay Claude Code or Codex session transcripts as a live flow graph. Transcript bytes are processed locally and are not uploaded."
     />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <!-- Same self-hosted brand fonts as the landing (Space Mono for the wordmark,
@@ -584,7 +585,7 @@ const wasmBase = '/wasm';
         auto: {
           label: 'Auto-detect',
           path: '~/.claude/projects or ~/.codex/sessions',
-          help: 'Claude Code remains the compatible default. Auto-detect also accepts Codex rollout files.',
+          help: 'Claude Code remains the compatible default. Auto-detect also accepts Codex rollout files; mixed selections require an explicit provider.',
         },
         claude: {
           label: 'Claude Code',
@@ -709,9 +710,35 @@ const wasmBase = '/wasm';
             parent: stringId(payload.parent_thread_id) || stringId(payload.parentThreadId),
             cwd: stringId(payload.cwd),
             timestamp: stringId(value.timestamp) || stringId(payload.timestamp),
+            modelProvider: stringId(payload.model_provider) || stringId(payload.modelProvider),
+            agentNickname: stringId(payload.agent_nickname) || stringId(payload.agentNickname),
           };
         }
-        return { id: '', parent: '', cwd: '', timestamp: '' };
+        return { id: '', parent: '', cwd: '', timestamp: '', modelProvider: '', agentNickname: '' };
+      }
+
+      // Keep the existing WASM ABI: Codex linkage travels through the optional
+      // Claude-compatible sidecar fields already accepted by replay_from_session.
+      // The core adapter treats this control prefix as a parent thread id.
+      const CODEX_PARENT_PREFIX = '\u001fcodex-parent:';
+
+      function codexWorkflow(meta, rootId) {
+        if (!meta.parent || meta.parent === rootId) return undefined;
+        return CODEX_PARENT_PREFIX + meta.parent;
+      }
+
+      function codexSubagentMeta(record) {
+        const description = record.meta.agentNickname || record.meta.modelProvider;
+        return JSON.stringify(description ? { agentType: 'codex', description } : { agentType: 'codex' });
+      }
+
+      function codexSubagent(record, rootId, transcript) {
+        return {
+          agent_id: record.meta.id || record.name,
+          meta: codexSubagentMeta(record),
+          transcript,
+          workflow: codexWorkflow(record.meta, rootId),
+        };
       }
 
       function codexGroupRecords(records) {
@@ -770,6 +797,13 @@ const wasmBase = '/wasm';
       async function buildSession(files) {
         const codexNames = files.filter((file) => CODEX_ROLLOUT_JSONL.test(file.name));
         const claudeNames = files.filter((file) => !CODEX_ROLLOUT_JSONL.test(file.name) && file.name.endsWith('.jsonl'));
+        const hasClaude = claudeNames.some((file) => UUID_JSONL.test(file.name));
+        if (selectedProvider === 'auto' && codexNames.length && hasClaude) {
+          return {
+            error:
+              'Both Claude Code and Codex transcripts were found. Select Claude Code or Codex explicitly before opening these files.',
+          };
+        }
         if (selectedProvider === 'codex' || (selectedProvider === 'auto' && codexNames.length && !claudeNames.some((file) => UUID_JSONL.test(file.name)))) {
           const groups = await groupCodexFiles(codexNames);
           if (!groups.length) return { error: 'No supported Codex rollout found in the dropped files.' };
@@ -780,7 +814,7 @@ const wasmBase = '/wasm';
           if (!detected) return { error: 'The dropped Codex rollout does not match the selected provider.' };
           const subs = [];
           for (const related of chosen.related) {
-            subs.push({ agent_id: related.meta.id || related.name, meta: '', transcript: await related.file.text() });
+            subs.push(codexSubagent(related, chosen.uuid, await related.file.text()));
           }
           return {
             provider: 'codex',
@@ -951,30 +985,41 @@ const wasmBase = '/wasm';
       // the recursive walk to that date-shaped tree so selecting Home remains
       // responsive and never scans unrelated files. Authentication files are
       // not inspected.
-      async function collectCodexRecords(dir, depth = 0) {
+      async function collectCodexRecords(dir, depth = 0, cache = null, path = '', progress = null) {
         if (depth > 8) return [];
         const records = [];
-        let scanned = 0;
+        const scan = progress || { count: 0 };
+        const childDirs = [];
         for await (const [name, handle] of dir.entries()) {
           if (handle.kind === 'file' && CODEX_ROLLOUT_JSONL.test(name)) {
+            const key = path ? `${path}/${name}` : name;
+            let meta = cache?.get(key);
             try {
-              const head = await (await handle.getFile()).slice(0, 65536).text();
-              if (sniffProvider(head) === 'codex') {
-                records.push({ handle, name, meta: codexMeta(head), dir });
+              if (!meta) {
+                const head = await (await handle.getFile()).slice(0, 65536).text();
+                if (sniffProvider(head) === 'codex') {
+                  meta = codexMeta(head);
+                  cache?.set(key, meta);
+                }
               }
+              if (meta) records.push({ handle, name, meta, dir });
             } catch {
               // A rollout may still be open for writing; skip this tick.
             }
-            if (++scanned % 20 === 0) {
-              setStatus(`scanning Codex sessions… ${scanned} rollouts checked`);
+            if (++scan.count % 20 === 0) {
+              setStatus(`scanning Codex sessions… ${scan.count} rollouts checked`);
               await yieldToUi();
             }
+          } else if (
+            handle.kind === 'directory' &&
+            (name === 'sessions' || /^\d{4}$/.test(name) || /^\d{2}$/.test(name))
+          ) {
+            childDirs.push([name, handle]);
           }
         }
-        for await (const [name, handle] of dir.entries()) {
-          if (handle.kind !== 'directory') continue;
-          if (name !== 'sessions' && !/^\d{4}$/.test(name) && !/^\d{2}$/.test(name)) continue;
-          records.push(...(await collectCodexRecords(handle, depth + 1)));
+        for (const [name, handle] of childDirs) {
+          const childPath = path ? `${path}/${name}` : name;
+          records.push(...(await collectCodexRecords(handle, depth + 1, cache, childPath, scan)));
         }
         return records;
       }
@@ -1005,7 +1050,9 @@ const wasmBase = '/wasm';
         if (selectedProvider === 'codex') return detectCodex(dir);
         if (selectedProvider === 'claude') return detectClaude(dir, depth);
         const claude = await detectClaude(dir, depth);
-        return claude || detectCodex(dir);
+        const codex = await detectCodex(dir);
+        if (claude && codex) return { mixed: true };
+        return claude || codex;
       }
 
       // Point at anything from Home down to a repo folder; we find the sessions.
@@ -1029,6 +1076,13 @@ const wasmBase = '/wasm';
           found = await detect(dir);
         } catch (e) {
           setStatus('Could not read that folder: ' + (e?.message ?? e), true);
+          return;
+        }
+        if (found?.mixed) {
+          setStatus(
+            'Both Claude Code and Codex sessions were found. Select Claude Code or Codex explicitly before opening this folder.',
+            true,
+          );
           return;
         }
         if (!found) {
@@ -1130,6 +1184,13 @@ const wasmBase = '/wasm';
         setStatus('scanning for sessions…');
         const hasCodex = files.some((file) => CODEX_ROLLOUT_JSONL.test(file.name));
         const hasClaude = files.some((file) => UUID_JSONL.test(file.name));
+        if (selectedProvider === 'auto' && hasCodex && hasClaude) {
+          setStatus(
+            'Both Claude Code and Codex transcripts were found. Select Claude Code or Codex explicitly before opening this folder.',
+            true,
+          );
+          return;
+        }
         const repos =
           selectedProvider === 'codex' || (selectedProvider === 'auto' && hasCodex && !hasClaude)
             ? await detectCodexFromFiles(files)
@@ -1161,6 +1222,11 @@ const wasmBase = '/wasm';
             lastModified = s.mainFile.lastModified;
             size = s.mainFile.size;
             title = await previewTitle(s.mainFile);
+            if (r.provider === 'codex') {
+              for (const related of s.relatedFiles || []) {
+                lastModified = Math.max(lastModified, related.file.lastModified || 0);
+              }
+            }
           } catch {}
           sessions.push({
             uuid: s.uuid,
@@ -1192,6 +1258,14 @@ const wasmBase = '/wasm';
             lastModified = file.lastModified;
             size = file.size;
             title = await previewTitle(file);
+            if (provider === 'codex') {
+              for (const related of value.related || []) {
+                try {
+                  const child = await related.handle.getFile();
+                  lastModified = Math.max(lastModified, child.lastModified || 0);
+                } catch {}
+              }
+            }
           } catch {}
           sessions.push({
             uuid,
@@ -1384,11 +1458,7 @@ const wasmBase = '/wasm';
             if (s.provider === 'codex') {
               const subs = [];
               for (const related of s.codexRollouts || []) {
-                subs.push({
-                  agent_id: related.meta.id || related.name,
-                  meta: '',
-                  transcript: await related.file.text(),
-                });
+                subs.push(codexSubagent(related, s.uuid, await related.file.text()));
               }
               zoetrope_load(mainText, JSON.stringify(subs), false);
               setStatus(`replaying ${label} · Codex · ${subs.length} related rollout${subs.length === 1 ? '' : 's'}`);
@@ -1429,6 +1499,9 @@ const wasmBase = '/wasm';
                 provider: 'codex',
                 mainHandle: s.mainHandle,
                 mainName: s.uuid,
+                rootId: s.uuid,
+                codexDirHandle: s.codexDirHandle,
+                codexRecords: new Map(),
                 codexRollouts,
                 subs: {},
                 mainConsumed: 0,
@@ -1440,8 +1513,8 @@ const wasmBase = '/wasm';
                 const text = await (await related.handle.getFile()).text();
                 const r = freshLines(text, 0);
                 const id = related.meta.id || related.name;
-                subsInit.push({ agent_id: id, meta: '', transcript: r.fresh });
-                state.subs[id] = { handle: related.handle, consumed: r.consumed };
+                subsInit.push(codexSubagent(related, state.rootId, r.fresh));
+                state.subs[id] = { handle: related.handle, consumed: r.consumed, metaSent: true };
               }
               zoetrope_load(m.fresh, JSON.stringify(subsInit), true);
               liveState = state;
@@ -1450,11 +1523,7 @@ const wasmBase = '/wasm';
             } else {
               const subs = [];
               for (const related of codexRollouts) {
-                subs.push({
-                  agent_id: related.meta.id || related.name,
-                  meta: '',
-                  transcript: await (await related.handle.getFile()).text(),
-                });
+                subs.push(codexSubagent(related, s.uuid, await (await related.handle.getFile()).text()));
               }
               zoetrope_load(mainText, JSON.stringify(subs), false);
               setStatus(`replaying ${label} · Codex · ${subs.length} related rollout${subs.length === 1 ? '' : 's'}`);
@@ -1529,14 +1598,38 @@ const wasmBase = '/wasm';
 
           const subsOut = [];
           if (s.provider === 'codex') {
+            // Codex can create child rollouts after the root is opened. Rewalk
+            // the selected sessions tree on every tick, while caching the
+            // immutable session headers so a large history does not cause a
+            // 64 KiB read for every rollout each second.
+            if (s.codexDirHandle) {
+              const records = await collectCodexRecords(s.codexDirHandle, 0, s.codexRecords);
+              const groups = codexGroupRecords(records);
+              const group =
+                groups.find((candidate) => candidate.uuid === s.rootId) ||
+                groups.find((candidate) => (candidate.main.meta.id || candidate.main.name) === s.rootId);
+              if (group) {
+                s.codexRollouts = group.related;
+                for (const related of s.codexRollouts) {
+                  const id = related.meta.id || related.name;
+                  const entry = (s.subs[id] ??= { handle: related.handle, consumed: 0, metaSent: false });
+                  entry.handle = related.handle;
+                }
+              }
+            }
             for (const related of s.codexRollouts || []) {
               const id = related.meta.id || related.name;
-              const entry = (s.subs[id] ??= { handle: related.handle, consumed: 0 });
+              const entry = (s.subs[id] ??= { handle: related.handle, consumed: 0, metaSent: false });
+              entry.handle = related.handle;
               const text = await (await entry.handle.getFile()).text();
               const r = freshLines(text, entry.consumed);
-              if (r.fresh) {
-                subsOut.push({ agent_id: id, meta: '', transcript: r.fresh });
+              const meta = entry.metaSent ? '' : codexSubagentMeta(related);
+              if (r.fresh || meta) {
+                const payload = codexSubagent(related, s.rootId, r.fresh);
+                payload.meta = meta;
+                subsOut.push(payload);
                 entry.consumed = r.consumed;
+                entry.metaSent = true;
               }
             }
           } else if (s.subagentsDir) {
